@@ -160,12 +160,12 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
 TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 3.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_ACT_R      = 4.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
 RISK_PCT         = 0.01   # risk per trade = 1% dari total equity
-LEVERAGE         = 25     # leverage (dibatasi max_leverage coin). Naikkan utk hemat margin (slot lebih banyak)
+LEVERAGE         = 15     # leverage (dibatasi max_leverage coin). Naikkan utk hemat margin (slot lebih banyak)
 MIN_ORDER_USD    = 5.0    # minimum order value Bybit
 ORDER_BUMP_FLOOR = 4.0    # order >= ini & < $5 -> naikkan qty ke $5 (over-risk <=1.25x); di bawah ini skip
 SBR_MODE         = True   # True = SBR entry di C1.close + SL di C1.low, False = OCL entry lama
@@ -203,7 +203,7 @@ INDUCEMENT_MOMENTUM_MAX_CANDLES = 5   # window maksimum: N candle H1 terbaru (te
 INDUCEMENT_MOMENTUM_MIN_CANDLES = 3   # kalau candle sejak puncak < ini -> jangan entry (data kurang)
 IDM_CANCEL_MOVE_PCT = 0.10  # (lama, hanya aktif kalau IDM_M5_ENGULF=False) batalkan limit IDM jika harga bergerak > N×range BOS dari trigger
 IDM_M5_ENGULF       = True  # True = setelah trigger tersapu, monitor M5 engulfing dulu sebelum market entry
-IDM_CANCEL_RANGE_PCT= 0.20  # hangus permanen jika harga >N×range BOS dari trigger ke arah mana pun (IDM_M5_ENGULF=True)
+IDM_CANCEL_RANGE_PCT= 0.80  # hangus permanen jika harga >N×range BOS dari trigger ke arah mana pun (IDM_M5_ENGULF=True)
 REQUIRE_FRESH_C1 = True    # True = tolak FVG bila C1.close sudah disentuh candle SETELAH C3 (zona tak fresh)
 
 # --- Filter konfluensi funding rate (window pre-settlement) ---
@@ -2404,37 +2404,24 @@ def check_idm_pending():
                           f"menunggu sweep ({_pct_idm:.2f}% lagi)")
 
             # Cek hangus permanen: harga keluar ±20% range BOS dari trigger
+            # HANYA dari candle setelah trigger disentuh (placed_ts), bukan seluruh historis.
             if trig and rng:
                 cancel_thr_up   = trig + IDM_CANCEL_RANGE_PCT * rng
                 cancel_thr_down = trig - IDM_CANCEL_RANGE_PCT * rng
-                hi_max = float(df_m5_idm['high'].max())
-                lo_min = float(df_m5_idm['low'].min())
-                if hi_max > cancel_thr_up or lo_min < cancel_thr_down:
-                    print(f"🚫 {coin}: IDM {e_stype_idm} HANGUS PERMANEN — harga keluar "
-                          f"±{IDM_CANCEL_RANGE_PCT*100:.0f}% dari trigger {trig:.6g} "
-                          f"(hi={hi_max:.6g} lo={lo_min:.6g} batas={cancel_thr_down:.6g}-{cancel_thr_up:.6g})")
-                    # Tandai inducement_done supaya IDM ini tidak masuk lagi di loop berikutnya
-                    # key pakai BOS besar (stype = kebalikan e_stype_idm)
-                    _bos_stype_h = "Short" if e_stype_idm == "Long" else "Long"
-                    _sig_hangus = (p.get('swing_val'), p.get('choch_level'), e_stype_idm)
-                    inducement_done[(coin, _bos_stype_h)] = _sig_hangus
-                    del idm_pending[key]
-                    continue
-
-            # Setup sementara untuk check_m5_engulfing
-            # IDM Short (BOS Long): fokus candle yang menyentuh trigger (low candle = trigger level)
-            # Engulfing = close < low candle fokus → konfirmasi tekanan jual
-            m5_setup = {
-                'type': e_stype_idm,
-                'orig_ocl': trig,   # gunakan trigger sebagai "C1 close" untuk deteksi sentuhan
-                'm5_c1c_touched': p.get('m5_triggered', False),
-                'm5_focus_hi': p.get('m5_focus_hi', 0.0),
-                'm5_focus_lo': p.get('m5_focus_lo', 0.0),
-                'm5_focus_idx': p.get('m5_focus_idx', 0),
-                'peak_val': trig + bos_rng_idm,
-                'choch_level': trig - bos_rng_idm,
-                'created_ts': p.get('placed_ts', 0),   # filter candle historis
-            }
+                placed_ms = p.get('placed_ts', 0) * 1000
+                df_since = df_m5_idm[df_m5_idm['ts'] >= placed_ms] if placed_ms > 0 else df_m5_idm
+                if len(df_since) > 0:
+                    hi_max = float(df_since['high'].max())
+                    lo_min = float(df_since['low'].min())
+                    if hi_max > cancel_thr_up or lo_min < cancel_thr_down:
+                        print(f"🚫 {coin}: IDM {e_stype_idm} HANGUS PERMANEN — harga keluar "
+                              f"±{IDM_CANCEL_RANGE_PCT*100:.0f}% dari trigger {trig:.6g} "
+                              f"(hi={hi_max:.6g} lo={lo_min:.6g} batas={cancel_thr_down:.6g}-{cancel_thr_up:.6g})")
+                        _bos_stype_h = "Short" if e_stype_idm == "Long" else "Long"
+                        _sig_hangus = (p.get('swing_val'), p.get('choch_level'), e_stype_idm)
+                        inducement_done[(coin, _bos_stype_h)] = _sig_hangus
+                        del idm_pending[key]
+                        continue
             engulf = check_m5_engulfing(coin, m5_setup, df_m5_idm, bos_rng_idm)
             # Simpan state kembali ke idm_pending
             p['m5_triggered']  = m5_setup['m5_c1c_touched']
