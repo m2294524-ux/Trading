@@ -160,7 +160,7 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
 TRAIL_STOP       = 2.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 10.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_ACT_R      = 8.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -203,7 +203,7 @@ INDUCEMENT_MOMENTUM_MAX_CANDLES = 5   # window maksimum: N candle H1 terbaru (te
 INDUCEMENT_MOMENTUM_MIN_CANDLES = 3   # kalau candle sejak puncak < ini -> jangan entry (data kurang)
 IDM_CANCEL_MOVE_PCT = 0.10  # (lama, hanya aktif kalau IDM_M5_ENGULF=False) batalkan limit IDM jika harga bergerak > N×range BOS dari trigger
 IDM_M5_ENGULF       = True  # True = setelah trigger tersapu, monitor M5 engulfing dulu sebelum market entry
-IDM_CANCEL_RANGE_PCT= 0.80  # hangus permanen jika harga >N×range BOS dari trigger ke arah mana pun (IDM_M5_ENGULF=True)
+IDM_CANCEL_RANGE_PCT= 0.20  # hangus permanen jika harga >N×range BOS dari trigger ke arah mana pun (IDM_M5_ENGULF=True)
 REQUIRE_FRESH_C1 = True    # True = tolak FVG bila C1.close sudah disentuh candle SETELAH C3 (zona tak fresh)
 
 # --- Filter konfluensi funding rate (window pre-settlement) ---
@@ -2075,43 +2075,68 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     focus_hi  = float(setup['m5_focus_hi'])
     focus_lo  = float(setup['m5_focus_lo'])
 
+    # State range_base: aktif saat candle pertama tidak melewati hi/lo fokus
+    # Di mode ini: sweep atas = jangan pindah fokus; sweep bawah / break atas = aksi normal
+    range_base = False
+    prev_hi = focus_hi   # untuk SL: low candle sebelum engulfing
+
     for i in range(focus_idx + 1, closed_end):
         lo = float(df_m5['low'].iloc[i])
         hi = float(df_m5['high'].iloc[i])
         cl = float(df_m5['close'].iloc[i])
+        prev_lo = float(df_m5['low'].iloc[i-1])   # low candle sebelumnya untuk SL
 
-        # ── Cek engulfing DULU sebelum update fokus ──
-        # Engulfing valid hanya jika candle yang sama TIDAK sweep sisi berlawanan.
-        # Kalau sweep sekaligus close (misal Long: lo<=focus_lo DAN cl>focus_hi) → bukan engulfing,
-        # tapi pindah fokus ke candle itu (candle terlalu volatile, tidak bisa dipercaya arahnya).
-        long_sweep_opp = (lo <= focus_lo)   # Long: sweep ke bawah (sisi berlawanan)
-        short_sweep_opp = (hi >= focus_hi)  # Short: sweep ke atas (sisi berlawanan)
+        # Masuk range_base jika candle masih dalam range fokus (tidak melewati hi atau lo)
+        if not range_base and hi < focus_hi and lo > focus_lo:
+            range_base = True
+            print(f"   {coin} {stype}: range base mode aktif idx={i}")
+
+        # ── Cek engulfing ──
+        # Engulfing valid: close melewati hi/lo fokus DAN tidak sweep sisi berlawanan sekaligus
+        long_sweep_opp  = (lo <= focus_lo)
+        short_sweep_opp = (hi >= focus_hi)
 
         if stype == 'Long' and cl > focus_hi and not long_sweep_opp:
             entry_p  = focus_hi
-            sl_price = focus_lo - SL_ENGULF_PCT * bos_rng
+            # SL: kalau range_base → pakai low candle sebelum engulfing; kalau tidak → pakai focus_lo
+            sl_price = (prev_lo - SL_ENGULF_PCT * bos_rng) if range_base else (focus_lo - SL_ENGULF_PCT * bos_rng)
             print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={focus_hi:.6g} "
+                  f"{'[range_base SL=prev_lo]' if range_base else ''}"
                   f"→ LIMIT entry={entry_p:.6g} SL={sl_price:.6g}")
             setup['m5_focus_idx'] = i
             return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
                     'engulf_idx': i, 'focus_hi': focus_hi, 'focus_lo': focus_lo}
         if stype == 'Short' and cl < focus_lo and not short_sweep_opp:
             entry_p  = focus_lo
-            sl_price = focus_hi + SL_ENGULF_PCT * bos_rng
+            sl_price = (prev_hi + SL_ENGULF_PCT * bos_rng) if range_base else (focus_hi + SL_ENGULF_PCT * bos_rng)
             print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={focus_lo:.6g} "
+                  f"{'[range_base SL=prev_hi]' if range_base else ''}"
                   f"→ LIMIT entry={entry_p:.6g} SL={sl_price:.6g}")
             setup['m5_focus_idx'] = i
             return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
                     'engulf_idx': i, 'focus_hi': focus_hi, 'focus_lo': focus_lo}
 
-        # ── Update fokus jika wick MENYENTUH (>=/<= bukan hanya >) atau close break ──
-        wick_out       = (hi >= focus_hi) or (lo <= focus_lo)
-        close_break_dn = (stype == 'Long'  and cl < focus_lo)
-        close_break_up = (stype == 'Short' and cl > focus_hi)
-        if wick_out or close_break_dn or close_break_up:
+        # ── Update fokus ──
+        if range_base:
+            # Range base mode: sweep atas = JANGAN pindah fokus (sinyal mau naik untuk Long)
+            # Sweep bawah atau break bawah = pindah fokus; sweep+close bawah = pindah fokus
+            if stype == 'Long':
+                should_shift = (lo <= focus_lo) or (cl < focus_lo)
+            else:
+                should_shift = (hi >= focus_hi) or (cl > focus_hi)
+        else:
+            # Mode normal: sentuhan ke arah mana pun = pindah fokus
+            wick_out = (hi >= focus_hi) or (lo <= focus_lo)
+            close_break_dn = (stype == 'Long' and cl < focus_lo)
+            close_break_up = (stype == 'Short' and cl > focus_hi)
+            should_shift = wick_out or close_break_dn or close_break_up
+
+        if should_shift:
+            prev_hi = focus_hi   # simpan hi fokus lama untuk SL
             focus_hi = hi; focus_lo = lo
             setup['m5_focus_hi']  = hi; setup['m5_focus_lo']  = lo
             setup['m5_focus_idx'] = i
+            range_base = False   # reset ke mode normal setelah pindah fokus
             print(f"   {coin} {stype}: fokus pindah ke M5 idx={i} hi={hi:.6g} lo={lo:.6g}")
 
     return None   # belum ada engulfing
@@ -2360,34 +2385,45 @@ def check_idm_pending():
             continue
         trig = p.get('trigger'); rng = p.get('rng')
 
-        # ── IDM WAIT_FILL: limit sudah terpasang — cek cancel conditions ──
+        # ── IDM WAIT_FILL: limit sudah terpasang — cancel jika CHOCH atau puncak ditembus ──
         if IDM_M5_ENGULF and p.get('phase') == 'WAIT_FILL' and p.get('order_id'):
-            df_m5_c = get_data(coin, "5", limit=10)
-            cancel_reason = None
-            # 1. CHOCH ditembus
-            if p.get('choch_level'):
-                df_h1_c = get_data(coin, "60", limit=20)
-                if df_h1_c is not None:
-                    bos_idx_c = max(0, len(df_h1_c) - 10)
-                    if choch_is_broken(df_h1_c, bos_idx_c, p['choch_level'], p['e_stype']):
-                        cancel_reason = f"CHOCH {p['choch_level']:.6g} ditembus"
-            # 2. Harga lari >20% range BOS ke arah BOS dari limit entry
-            if not cancel_reason and df_m5_c is not None and rng:
-                cancel_dist = IDM_CANCEL_RANGE_PCT * rng
-                limit_e = float(p.get('entry', 0))
-                if limit_e > 0:
-                    if p['e_stype'] == 'Short' and float(df_m5_c['low'].min()) <= limit_e - cancel_dist:
-                        cancel_reason = f"harga lari >{IDM_CANCEL_RANGE_PCT*100:.0f}%rng bawah limit"
-                    elif p['e_stype'] == 'Long' and float(df_m5_c['high'].max()) >= limit_e + cancel_dist:
-                        cancel_reason = f"harga lari >{IDM_CANCEL_RANGE_PCT*100:.0f}%rng atas limit"
-            if cancel_reason:
-                cancel_order(coin, p['order_id'])
-                print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — {cancel_reason}")
-                del idm_pending[key]
+            df_h1_c = get_data(coin, "60", limit=20)
+            if df_h1_c is not None:
+                bos_idx_c = max(0, len(df_h1_c) - 10)
+                # Cancel jika CHOCH ditembus
+                if p.get('choch_level') and choch_is_broken(df_h1_c, bos_idx_c, p['choch_level'], p['e_stype']):
+                    cancel_order(coin, p['order_id'])
+                    print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — CHOCH {p['choch_level']:.6g} ditembus")
+                    del idm_pending[key]
+                    continue
+                # Cancel jika puncak BOS besar ditembus (harga melewati peak_val ke arah berlawanan)
+                elif p.get('peak_val'):
+                    pk = float(p['peak_val'])
+                    curr_close = float(df_h1_c['close'].iloc[-1])
+                    bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
+                    peak_broken = (bos_stype == "Long" and curr_close > pk) or                                   (bos_stype == "Short" and curr_close < pk)
+                    if peak_broken:
+                        cancel_order(coin, p['order_id'])
+                        print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — puncak {pk:.6g} ditembus")
+                        del idm_pending[key]
+                        continue
             continue
 
         # ── IDM M5 ENGULF MODE ──
         if IDM_M5_ENGULF and p.get('order_id') is None and not p.get('m5_hangus'):
+            # Cek puncak BOS besar ditembus → hangus permanen
+            if p.get('peak_val'):
+                df_h1_pk = get_data(coin, "60", limit=5)
+                if df_h1_pk is not None:
+                    pk = float(p['peak_val'])
+                    curr_cl = float(df_h1_pk['close'].iloc[-1])
+                    bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
+                    if (bos_stype == "Long" and curr_cl > pk) or (bos_stype == "Short" and curr_cl < pk):
+                        print(f"🚫 {coin}: IDM {p['e_stype']} hangus — puncak {pk:.6g} ditembus")
+                        _bos_h = bos_stype
+                        inducement_done[(coin, _bos_h)] = (p.get('swing_val'), p.get('choch_level'), p['e_stype'])
+                        del idm_pending[key]
+                        continue
             df_m5_idm = get_data(coin, "5", limit=100)
             if df_m5_idm is None:
                 continue
@@ -2403,25 +2439,19 @@ def check_idm_pending():
                     print(f"👁️  IDM {coin} [{e_stype_idm}] | now:{_curr_idm:.6g} trigger:{trig:.6g} | "
                           f"menunggu sweep ({_pct_idm:.2f}% lagi)")
 
-            # Cek hangus permanen: harga keluar ±20% range BOS dari trigger
-            # HANYA dari candle setelah trigger disentuh (placed_ts), bukan seluruh historis.
-            if trig and rng:
-                cancel_thr_up   = trig + IDM_CANCEL_RANGE_PCT * rng
-                cancel_thr_down = trig - IDM_CANCEL_RANGE_PCT * rng
-                placed_ms = p.get('placed_ts', 0) * 1000
-                df_since = df_m5_idm[df_m5_idm['ts'] >= placed_ms] if placed_ms > 0 else df_m5_idm
-                if len(df_since) > 0:
-                    hi_max = float(df_since['high'].max())
-                    lo_min = float(df_since['low'].min())
-                    if hi_max > cancel_thr_up or lo_min < cancel_thr_down:
-                        print(f"🚫 {coin}: IDM {e_stype_idm} HANGUS PERMANEN — harga keluar "
-                              f"±{IDM_CANCEL_RANGE_PCT*100:.0f}% dari trigger {trig:.6g} "
-                              f"(hi={hi_max:.6g} lo={lo_min:.6g} batas={cancel_thr_down:.6g}-{cancel_thr_up:.6g})")
-                        _bos_stype_h = "Short" if e_stype_idm == "Long" else "Long"
-                        _sig_hangus = (p.get('swing_val'), p.get('choch_level'), e_stype_idm)
-                        inducement_done[(coin, _bos_stype_h)] = _sig_hangus
-                        del idm_pending[key]
-                        continue
+
+            # Build m5_setup untuk check_m5_engulfing
+            m5_setup = {
+                'type': e_stype_idm,
+                'orig_ocl': trig,
+                'm5_c1c_touched': p.get('m5_triggered', False),
+                'm5_focus_hi': p.get('m5_focus_hi', 0.0),
+                'm5_focus_lo': p.get('m5_focus_lo', 0.0),
+                'm5_focus_idx': p.get('m5_focus_idx', 0),
+                'peak_val': trig + bos_rng_idm,
+                'choch_level': trig - bos_rng_idm,
+                'created_ts': p.get('placed_ts', 0),
+            }
             engulf = check_m5_engulfing(coin, m5_setup, df_m5_idm, bos_rng_idm)
             # Simpan state kembali ke idm_pending
             p['m5_triggered']  = m5_setup['m5_c1c_touched']
