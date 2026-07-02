@@ -1244,10 +1244,18 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'swing_val': a['swing_val'], 'choch_level': a['choch_level'],
                     'peak_val': a['peak_val'], 'bos_type': e_stype,
                     # M5 monitor state
-                    'm5_triggered': False,
-                    'm5_trigger2': None,   # low/high candle M5 yang menyentuh trigger H1 (trigger2)
-                    'm5_trigger2_touched': False,  # apakah trigger2 sudah disentuh lagi
-                    'm5_focus_hi': 0.0, 'm5_focus_lo': 0.0, 'm5_focus_idx': 0,
+                    # `trig` = candle M5 yang SUDAH TERBUKTI menyapu trigger H1 (closed terakhir,
+                    # lihat definisi di atas). Sebelumnya trigger2 dibiarkan None dan di-re-scan dari
+                    # nol oleh check_m5_engulfing() pakai level H1 mentah (prot) -> salah candle acuan
+                    # (bisa nemu candle JAUH setelah sweep asli, karena candle sweep asli sendiri
+                    # sudah lewat filter created_ts). Sekarang di-seed langsung dari candle sweep asli
+                    # agar Tahap 1 (touch trigger H1) tidak diulang -> langsung ke Tahap 2 (tunggu
+                    # trigger2 disentuh candle SETELAHNYA).
+                    'm5_triggered': True,   # sentuhan trigger H1 sudah pasti terjadi di candle `trig`
+                    'm5_trigger2': float(trig['high']) if e_stype == 'Short' else float(trig['low']),
+                    'm5_trigger2_touched': False,  # apakah trigger2 sudah disentuh candle SETELAH `trig`
+                    'm5_focus_hi': float(trig['high']), 'm5_focus_lo': float(trig['low']),
+                    'm5_focus_idx': -1,   # -1 -> pencarian trigger2 mulai dari candle PERTAMA setelah `trig`
                     'm5_hangus': False,
                 }
                 inducement_done[(coin, stype)] = sig
@@ -1256,7 +1264,11 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     f"  {coin} | menunggu engulfing {e_stype} M5 | trigger={prot:.6g}\n"
                     f"  BOS BESAR ({stype}): break={a['swing_val']:.6g} choch={a['choch_level']:.6g} "
                     f"puncak={a['peak_val'] if a['peak_val'] is not None else a['B']:.6g} range={rng:.6g}\n"
-                    f"  IDM trigger={prot:.6g}@{idm['prot_idx']} | batal jika >±{IDM_CANCEL_RANGE_PCT*100:.0f}% range"
+                    f"  IDM trigger={prot:.6g}@{idm['prot_idx']} | batal jika >±{IDM_CANCEL_RANGE_PCT*100:.0f}% range\n"
+                    f"  SWEEP CANDLE M5 (trig): ts={int(trig['ts'])} low={float(trig['low']):.6g} "
+                    f"high={float(trig['high']):.6g} close={float(trig['close']):.6g} → "
+                    f"trigger2={idm_pending[_akey(coin, e_stype)]['m5_trigger2']:.6g} "
+                    f"(tunggu candle SETELAHNYA menyentuh trigger2)"
                 )
                 log_entry(rec)
                 if (not ALLOW_HEDGE) and coin in pending:
