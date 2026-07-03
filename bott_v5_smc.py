@@ -768,8 +768,9 @@ def _get_fvgs(df_h1, stype, bos_idx, choch_level=None, zone_lo=None, require_fre
             gaps = [g for g in gaps if g['bottom'] >= choch_level]
         else:
             gaps = [g for g in gaps if g['top'] <= choch_level]
-    # Filter ZONA ENTRY: C1 close harus di retrace z_lo..HI dari range BOS.
-    # C1 close = titik golden ratio filter sekaligus trigger entry.
+    # Filter ZONA ENTRY: GAP-nya sendiri (ujung masuk/entrance — top[Long]/bottom[Short], sisi
+    # yang sama dgn trigger1/gap_entry_point) harus di retrace z_lo..HI dari range BOS.
+    # Sebelumnya dicek pakai C1.close; sekarang gap-nya sendiri yg harus berada di 61.8%+ itu.
     if choch_level and len(df_h1) > bos_idx:
         if stype == "Long":
             B = float(df_h1['high'].iloc[bos_idx:].max())
@@ -778,7 +779,7 @@ def _get_fvgs(df_h1, stype, bos_idx, choch_level=None, zone_lo=None, require_fre
             if rng > 0:
                 lo = B - ENTRY_ZONE_HI * rng   # batas terdalam (CHOCH)
                 hi = B - z_lo * rng            # batas terdangkal
-                gaps = [g for g in gaps if lo <= g.get('c1_close', 0) <= hi]
+                gaps = [g for g in gaps if lo <= g.get('top', 0) <= hi]
         else:
             B = float(df_h1['low'].iloc[bos_idx:].min())
             L = float(choch_level)
@@ -786,7 +787,7 @@ def _get_fvgs(df_h1, stype, bos_idx, choch_level=None, zone_lo=None, require_fre
             if rng > 0:
                 lo = B + z_lo * rng            # batas terdangkal
                 hi = B + ENTRY_ZONE_HI * rng   # batas terdalam (CHOCH)
-                gaps = [g for g in gaps if lo <= g.get('c1_close', 0) <= hi]
+                gaps = [g for g in gaps if lo <= g.get('bottom', 0) <= hi]
     # MAX_GAP_PCT: gap tidak boleh terlalu besar
     result = []
     for g in gaps:
@@ -1977,8 +1978,8 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
             z618 = (Bp - zlo * rng) if stype == "Long" else (Bp + zlo * rng)
             tags = []
             for g in raw:
-                c1c = float(g.get('c1_close', 0))
-                r = ((Bp - c1c) if stype == "Long" else (c1c - Bp)) / rng * 100 if rng > 0 else 0
+                edge = float(g.get('top', 0)) if stype == "Long" else float(g.get('bottom', 0))
+                r = ((Bp - edge) if stype == "Long" else (edge - Bp)) / rng * 100 if rng > 0 else 0
                 if stype == "Long" and g['bottom'] < choch_level:
                     why = "choch"
                 elif stype == "Short" and g['top'] > choch_level:
@@ -1988,7 +1989,7 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
                         lo = Bp - ENTRY_ZONE_HI * rng; hi = Bp - zlo * rng
                     else:
                         lo = Bp + zlo * rng; hi = Bp + ENTRY_ZONE_HI * rng
-                    if not (lo <= c1c <= hi):
+                    if not (lo <= edge <= hi):
                         why = "dilewati" if r < zlo * 100 else "zona"
                     else:
                         gs = g['top'] - g['bottom']; ocl = float(g.get('c3_open', 0))
@@ -2170,7 +2171,6 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     # tanpa duplikasi logika. start_idx = index candle fokus AWAL (bukan yang discan duluan, dimulai +1).
     def _scan_engulf(start_idx, f_hi, f_lo):
         range_base = False
-        is_fvg = 'm5_fvg_trigger2' in setup   # FVG pakai entry 50% candle engulfing, IDM pakai prev candle
         for i in range(start_idx + 1, closed_end):
             lo = float(df_m5['low'].iloc[i])
             hi = float(df_m5['high'].iloc[i])
@@ -2188,14 +2188,13 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             long_sweep_opp  = (lo <= f_lo)
             short_sweep_opp = (hi >= f_hi)
 
-            # SL selalu dari candle SEBELUM engulfing (prev candle): Long SL = low prev - buffer,
-            # Short SL = high prev + buffer. Entry: FVG = 50% range candle ENGULFING itu sendiri,
-            # IDM = high/low candle SEBELUM engulfing (perilaku lama, tak berubah).
+            # SL dari candle SEBELUM engulfing (prev candle): Long SL = low prev - buffer,
+            # Short SL = high prev + buffer. Entry (FVG maupun IDM) = 50% range candle ENGULFING itu sendiri.
             prev_c_hi = float(df_m5['high'].iloc[i-1])
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
-                entry_p  = (hi + lo) / 2.0 if is_fvg else prev_c_hi
+                entry_p  = (hi + lo) / 2.0
                 sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
                       f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
@@ -2203,7 +2202,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
-                entry_p  = (hi + lo) / 2.0 if is_fvg else prev_c_lo
+                entry_p  = (hi + lo) / 2.0
                 sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
                       f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
