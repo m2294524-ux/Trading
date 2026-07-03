@@ -2025,6 +2025,11 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
         # M5 engulfing monitor state
         'm5_c1c_touched': False,
         'm5_focus_hi': 0.0, 'm5_focus_lo': 0.0, 'm5_focus_idx': 0,
+        # 2x engulfing (lihat check_m5_engulfing): engulfing pertama = pendahuluan, SL-nya jadi
+        # trigger2 (level retest); baru setelah trigger2 disentuh candle berikutnya, dicari
+        # engulfing BENERAN yang benar-benar dieksekusi.
+        'm5_fvg_trigger2': None,
+        'm5_fvg_trigger2_touched': False,
     }
     return setup, logline
 
@@ -2048,6 +2053,16 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
       'm5_focus_hi'    : float — high candle fokus aktif
       'm5_focus_lo'    : float — low candle fokus aktif
       'm5_focus_idx'   : int   — index candle fokus di df_m5
+
+    Dua mode trigger2 (independen, dibedakan dari field yang ada di setup):
+      IDM  ('m5_trigger2' ada)     : trigger2 = low/high candle yg menyapu trigger H1 IDM,
+                                      harus disentuh CANDLE SETELAHNYA dulu sebelum mulai
+                                      cari engulfing (lihat percakapan sebelumnya).
+      FVG  ('m5_fvg_trigger2' ada) : 2x ENGULFING. Engulfing pertama (pendahuluan) TIDAK
+                                      langsung dieksekusi — SL hasil engulfing pendahuluan itu
+                                      dijadikan trigger2 (level retest). Baru setelah candle
+                                      berikutnya menyentuh/melewati trigger2 itu, monitor mulai
+                                      lagi dari nol untuk cari engulfing BENERAN (yang dieksekusi).
     """
     if df_m5 is None or len(df_m5) < 2:
         return None
@@ -2112,88 +2127,129 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
         if not setup.get('m5_trigger2_touched'):
             return None   # trigger2 belum tersentuh
 
-    # ── Scan candle setelah fokus s/d candle closed terbaru (tidak termasuk candle berjalan) ──
+    # ── Scan generik candle fokus->engulfing (4 aturan dasar: fokus/pindah fokus/range base/engulfing) ──
+    # Dipisah jadi closure supaya bisa dipanggil 2x untuk FVG (engulfing pendahuluan + engulfing beneran)
+    # tanpa duplikasi logika. start_idx = index candle fokus AWAL (bukan yang discan duluan, dimulai +1).
+    def _scan_engulf(start_idx, f_hi, f_lo):
+        range_base = False
+        for i in range(start_idx + 1, closed_end):
+            lo = float(df_m5['low'].iloc[i])
+            hi = float(df_m5['high'].iloc[i])
+            cl = float(df_m5['close'].iloc[i])
+
+            # Masuk range_base jika candle masih dalam range fokus (tidak melewati hi atau lo)
+            if not range_base and hi < f_hi and lo > f_lo:
+                range_base = True
+                print(f"   {coin} {stype}: range base mode aktif idx={i}")
+
+            # ── Cek engulfing ──
+            # Engulfing valid: close melewati hi/lo fokus DAN tidak sweep sisi berlawanan sekaligus
+            # DAN bukan dalam range_base mode (di range_base, close melewati fokus = pindah fokus,
+            # bukan langsung engulfing — hanya sweep searah TANPA close yang menahan fokus).
+            long_sweep_opp  = (lo <= f_lo)
+            short_sweep_opp = (hi >= f_hi)
+
+            # Entry & SL selalu dari candle SEBELUM engulfing (prev candle), bukan candle fokus
+            # Long: entry = high prev candle, SL = low prev candle - buffer
+            # Short: entry = low prev candle, SL = high prev candle + buffer
+            prev_c_hi = float(df_m5['high'].iloc[i-1])
+            prev_c_lo = float(df_m5['low'].iloc[i-1])
+
+            if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
+                entry_p  = prev_c_hi
+                sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
+                print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
+                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                setup['m5_focus_idx'] = i
+                return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
+                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
+            if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
+                entry_p  = prev_c_lo
+                sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
+                print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
+                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                setup['m5_focus_idx'] = i
+                return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
+                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
+
+            # ── Update fokus ──
+            if range_base:
+                # Range base mode: engulfing TIDAK pernah valid langsung di mode ini (sudah dicegah
+                # oleh "not range_base" di atas). Fokus TETAP (tidak pindah) hanya jika:
+                #   (a) candle sepenuhnya di dalam range fokus (tidak menyentuh hi/lo sama sekali), atau
+                #   (b) candle sweep SEARAH engulfing TANPA close melewati fokus.
+                #   Long (searah=atas): hi menyentuh/lewat focus_hi TAPI close <= focus_hi → tahan fokus
+                #   Short (searah=bawah): lo menyentuh/lewat focus_lo TAPI close >= focus_lo → tahan fokus
+                # Semua kondisi LAIN (close lolos searah, atau gerak ke arah berlawanan) → pindah fokus.
+                fully_inside = (hi < f_hi) and (lo > f_lo)
+                if stype == 'Long':
+                    sweep_searah_only = (hi >= f_hi) and (cl <= f_hi) and (lo > f_lo)
+                else:
+                    sweep_searah_only = (lo <= f_lo) and (cl >= f_lo) and (hi < f_hi)
+                should_shift = not (fully_inside or sweep_searah_only)
+            else:
+                # Mode normal: sentuhan ke arah mana pun = pindah fokus
+                wick_out = (hi >= f_hi) or (lo <= f_lo)
+                close_break_dn = (stype == 'Long' and cl < f_lo)
+                close_break_up = (stype == 'Short' and cl > f_hi)
+                should_shift = wick_out or close_break_dn or close_break_up
+
+            if should_shift:
+                f_hi = hi; f_lo = lo
+                setup['m5_focus_hi']  = hi; setup['m5_focus_lo']  = lo
+                setup['m5_focus_idx'] = i
+                range_base = False   # reset ke mode normal setelah pindah fokus
+                print(f"   {coin} {stype}: fokus pindah ke M5 idx={i} hi={hi:.6g} lo={lo:.6g}")
+
+        return None   # belum ada engulfing di data yang tersedia
+
     focus_idx = setup.get('m5_focus_idx', 0)
     focus_hi  = float(setup['m5_focus_hi'])
     focus_lo  = float(setup['m5_focus_lo'])
 
-    # State range_base: aktif saat candle pertama tidak melewati hi/lo fokus
-    # Di mode ini: sweep atas = jangan pindah fokus; sweep bawah / break atas = aksi normal
-    range_base = False
-    prev_hi = focus_hi   # untuk SL: low candle sebelum engulfing
+    # Setup TANPA field 'm5_fvg_trigger2' (mis. IDM) -> perilaku lama: 1x engulfing langsung eksekusi
+    if 'm5_fvg_trigger2' not in setup:
+        return _scan_engulf(focus_idx, focus_hi, focus_lo)
 
-    for i in range(focus_idx + 1, closed_end):
-        lo = float(df_m5['low'].iloc[i])
-        hi = float(df_m5['high'].iloc[i])
-        cl = float(df_m5['close'].iloc[i])
-        prev_lo = float(df_m5['low'].iloc[i-1])   # low candle sebelumnya untuk SL
+    # ── FVG: 2x engulfing ──
+    # Tahap A: cari engulfing PENDAHULUAN (belum dieksekusi) selama trigger2 belum ditemukan
+    if setup.get('m5_fvg_trigger2') is None:
+        r = _scan_engulf(focus_idx, focus_hi, focus_lo)
+        if r is None:
+            return None   # engulfing pendahuluan belum terjadi
+        trig2 = r['sl']   # SL dari engulfing pendahuluan = trigger2 (level retest)
+        setup['m5_fvg_trigger2'] = trig2
+        setup['m5_fvg_trigger2_touched'] = False
+        print(f"   {coin} {stype}: engulfing PENDAHULUAN idx={r['engulf_idx']} (SL={trig2:.6g}) "
+              f"→ ini BUKAN entry, tunggu retest trigger2 dulu sebelum cari engulfing BENERAN")
+        # fall-through: langsung cek retest di data yang sama kalau tersedia (tidak return dulu)
 
-        # Masuk range_base jika candle masih dalam range fokus (tidak melewati hi atau lo)
-        if not range_base and hi < focus_hi and lo > focus_lo:
-            range_base = True
-            print(f"   {coin} {stype}: range base mode aktif idx={i}")
+    # Tahap retest: trigger2 sudah ada, tapi belum tersentuh candle SETELAH engulfing pendahuluan
+    if setup.get('m5_fvg_trigger2') is not None and not setup.get('m5_fvg_trigger2_touched'):
+        trig2 = float(setup['m5_fvg_trigger2'])
+        hit_idx = None
+        for i in range(setup.get('m5_focus_idx', 0) + 1, closed_end):
+            lo = float(df_m5['low'].iloc[i])
+            hi = float(df_m5['high'].iloc[i])
+            hit2 = (stype == 'Long' and lo <= trig2) or (stype == 'Short' and hi >= trig2)
+            if hit2:
+                hit_idx = i
+                break
+        if hit_idx is None:
+            return None   # retest trigger2 belum terjadi
+        setup['m5_fvg_trigger2_touched'] = True
+        setup['m5_focus_hi']  = float(df_m5['high'].iloc[hit_idx])
+        setup['m5_focus_lo']  = float(df_m5['low'].iloc[hit_idx])
+        setup['m5_focus_idx'] = hit_idx
+        print(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 idx={hit_idx} "
+              f"hi={setup['m5_focus_hi']:.6g} lo={setup['m5_focus_lo']:.6g} — mulai monitor engulfing BENERAN")
+        # fall-through: langsung cek engulfing beneran di data yang sama kalau tersedia
 
-        # ── Cek engulfing ──
-        # Engulfing valid: close melewati hi/lo fokus DAN tidak sweep sisi berlawanan sekaligus
-        # DAN bukan dalam range_base mode (di range_base, close melewati fokus = pindah fokus,
-        # bukan langsung engulfing — hanya sweep searah TANPA close yang menahan fokus).
-        long_sweep_opp  = (lo <= focus_lo)
-        short_sweep_opp = (hi >= focus_hi)
-
-        # Entry & SL selalu dari candle SEBELUM engulfing (prev candle), bukan candle fokus
-        # Long: entry = high prev candle, SL = low prev candle - buffer
-        # Short: entry = low prev candle, SL = high prev candle + buffer
-        prev_c_hi = float(df_m5['high'].iloc[i-1])
-        prev_c_lo = float(df_m5['low'].iloc[i-1])
-
-        if stype == 'Long' and cl > focus_hi and not long_sweep_opp and not range_base:
-            entry_p  = prev_c_hi
-            sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
-            print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={focus_hi:.6g} "
-                  f"→ LIMIT entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
-            setup['m5_focus_idx'] = i
-            return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
-                    'engulf_idx': i, 'focus_hi': focus_hi, 'focus_lo': focus_lo}
-        if stype == 'Short' and cl < focus_lo and not short_sweep_opp and not range_base:
-            entry_p  = prev_c_lo
-            sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
-            print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={focus_lo:.6g} "
-                  f"→ LIMIT entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
-            setup['m5_focus_idx'] = i
-            return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
-                    'engulf_idx': i, 'focus_hi': focus_hi, 'focus_lo': focus_lo}
-
-        # ── Update fokus ──
-        if range_base:
-            # Range base mode: engulfing TIDAK pernah valid langsung di mode ini (sudah dicegah
-            # oleh "not range_base" di atas). Fokus TETAP (tidak pindah) hanya jika:
-            #   (a) candle sepenuhnya di dalam range fokus (tidak menyentuh hi/lo sama sekali), atau
-            #   (b) candle sweep SEARAH engulfing TANPA close melewati fokus.
-            #   Long (searah=atas): hi menyentuh/lewat focus_hi TAPI close <= focus_hi → tahan fokus
-            #   Short (searah=bawah): lo menyentuh/lewat focus_lo TAPI close >= focus_lo → tahan fokus
-            # Semua kondisi LAIN (close lolos searah, atau gerak ke arah berlawanan) → pindah fokus.
-            fully_inside = (hi < focus_hi) and (lo > focus_lo)
-            if stype == 'Long':
-                sweep_searah_only = (hi >= focus_hi) and (cl <= focus_hi) and (lo > focus_lo)
-            else:
-                sweep_searah_only = (lo <= focus_lo) and (cl >= focus_lo) and (hi < focus_hi)
-            should_shift = not (fully_inside or sweep_searah_only)
-        else:
-            # Mode normal: sentuhan ke arah mana pun = pindah fokus
-            wick_out = (hi >= focus_hi) or (lo <= focus_lo)
-            close_break_dn = (stype == 'Long' and cl < focus_lo)
-            close_break_up = (stype == 'Short' and cl > focus_hi)
-            should_shift = wick_out or close_break_dn or close_break_up
-
-        if should_shift:
-            prev_hi = focus_hi   # simpan hi fokus lama untuk SL
-            focus_hi = hi; focus_lo = lo
-            setup['m5_focus_hi']  = hi; setup['m5_focus_lo']  = lo
-            setup['m5_focus_idx'] = i
-            range_base = False   # reset ke mode normal setelah pindah fokus
-            print(f"   {coin} {stype}: fokus pindah ke M5 idx={i} hi={hi:.6g} lo={lo:.6g}")
-
-    return None   # belum ada engulfing
+    # Tahap B: cari engulfing BENERAN (baru sampai sini kalau trigger2 sudah tersentuh) -> ini yang dieksekusi
+    focus_idx = setup.get('m5_focus_idx', 0)
+    focus_hi  = float(setup['m5_focus_hi'])
+    focus_lo  = float(setup['m5_focus_lo'])
+    return _scan_engulf(focus_idx, focus_hi, focus_lo)
 
 
 def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
