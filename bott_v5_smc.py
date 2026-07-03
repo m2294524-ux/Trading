@@ -828,6 +828,41 @@ def c1_is_fresh(df, gap, stype):
             return False
     return True
 
+
+def gap_entry_point(df, gap, stype, peak_idx):
+    """Trigger1 FVG = titik AWAL masuk gap yang MASIH KOSONG (bukan C1.close lagi).
+    Default = ujung C3 (top gap untuk Long = low[C3], bottom gap untuk Short = high[C3]) —
+    ini sisi gap yang PERTAMA disentuh candle saat harga retrace balik ke arah gap.
+    Kalau ANTARA C3 dan puncak ada candle H1 yang sudah masuk SEBAGIAN ke gap (partial fill —
+    belum full sampai C1, karena full-fill itu domain c1_is_fresh/freshness terpisah dan
+    gap-nya sudah dibuang duluan kalau itu terjadi), trigger digeser ke titik TERDALAM yang
+    sudah pernah disentuh candle tsb. Supaya bot tidak memantau level yang secara historis
+    sudah "terpakai" — sisa area kosong yang tersisa itulah yang jadi trigger baru."""
+    c3i = gap.get('c3_idx')
+    if c3i is None:
+        return float(gap['top']) if stype == 'Long' else float(gap['bottom'])
+    scan_end = int(peak_idx) if peak_idx is not None else (len(df) - 1)
+    scan_end = min(scan_end, len(df) - 1)
+    if stype == 'Long':
+        raw_edge = float(gap['top'])      # low[C3] = ujung gap paling atas (paling dekat harga)
+        far_edge = float(gap['bottom'])   # high[C1] = ujung gap paling dalam
+        deepest  = raw_edge
+        for k in range(int(c3i) + 1, scan_end + 1):
+            lo_k = float(df['low'].iloc[k])
+            if lo_k < deepest:
+                deepest = max(lo_k, far_edge)   # jangan lewat far_edge (itu domain c1_is_fresh)
+        return deepest
+    else:
+        raw_edge = float(gap['bottom'])   # high[C3] = ujung gap paling bawah (paling dekat harga)
+        far_edge = float(gap['top'])      # low[C1] = ujung gap paling dalam
+        deepest  = raw_edge
+        for k in range(int(c3i) + 1, scan_end + 1):
+            hi_k = float(df['high'].iloc[k])
+            if hi_k > deepest:
+                deepest = min(hi_k, far_edge)
+        return deepest
+
+
 def c2_wick_still_valid(df, gap, stype, sl_dist):
     """Cek apakah C2 wick masih valid sebagai entry saat ENTRY_C2_WICK=True.
     Kondisi HANGUS: C1.close sudah tersentuh DAN setelah itu harga jalan ke arah BOS
@@ -1974,12 +2009,15 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
     if not (c1_c > 0 and c1_h > c1_l):
         return None, None
     gap_s = float(g0['top']) - float(g0['bottom'])
-    # Trigger entry = ujung C3 (batas gap: top untuk Long, bottom untuk Short)
+    # Trigger1 = titik AWAL masuk gap yang masih kosong (ujung C3: low[C3] utk Long / high[C3] utk
+    # Short) — DIGESER ke titik terdalam yg sudah pernah diisi candle H1 antara C3->puncak kalau ada
+    # partial fill (bukan C1.close lagi, dan bukan selalu ujung C3 mentah kalau sudah kesentuh sebagian).
+    trig1 = gap_entry_point(df_h1_live, g0, stype, peak_idx)
     if stype == 'Long':
-        entry_adj = c1_c                  # C1 close = trigger sentuhan M5
+        entry_adj = trig1                 # trigger1 = sentuhan M5 dimulai di sini
         dist = 0.0; sl_entry = entry_adj  # akan di-override SL_FIXED_RANGE di bawah
     else:
-        entry_adj = c1_c                  # C1 close = trigger sentuhan M5
+        entry_adj = trig1                 # trigger1 = sentuhan M5 dimulai di sini
         dist = 0.0; sl_entry = entry_adj
 
     import datetime as _dt
@@ -2013,8 +2051,8 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
     choch_str = f"{choch_level:.6g}" if choch_level else "—"
     _slr = (dist / bos_rng * 100) if bos_rng > 0 else 0
     logline = (f"\n📊 {coin} | BOS {stype} | break:{swing_val:.6g} puncak:{_B:.6g} CHOCH:{choch_str} | "
-               f"OCL:{c1_c:.6f} Entry:{entry_adj:.6f} SL:{sl_entry:.6f} "
-               f"dist:{dist/c1_c*100:.3f}% (SL {_slr:.1f}% range) Gap:{gap_s/c1_c*100:.3f}%")
+               f"C1close:{c1_c:.6f} Trigger1(gap):{trig1:.6f} SL:{sl_entry:.6f} "
+               f"dist:{dist/entry_adj*100:.3f}% (SL {_slr:.1f}% range) Gap:{gap_s/entry_adj*100:.3f}%")
     setup = {
         'type': stype, 'phase': 'WAIT_APPROACH', 'entry': entry_adj, 'sl': sl_entry,
         'dist': dist, 'orig_ocl': c1_c,   # C1 close = trigger sentuhan M5
@@ -2132,6 +2170,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     # tanpa duplikasi logika. start_idx = index candle fokus AWAL (bukan yang discan duluan, dimulai +1).
     def _scan_engulf(start_idx, f_hi, f_lo):
         range_base = False
+        is_fvg = 'm5_fvg_trigger2' in setup   # FVG pakai entry 50% candle engulfing, IDM pakai prev candle
         for i in range(start_idx + 1, closed_end):
             lo = float(df_m5['low'].iloc[i])
             hi = float(df_m5['high'].iloc[i])
@@ -2149,25 +2188,25 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             long_sweep_opp  = (lo <= f_lo)
             short_sweep_opp = (hi >= f_hi)
 
-            # Entry & SL selalu dari candle SEBELUM engulfing (prev candle), bukan candle fokus
-            # Long: entry = high prev candle, SL = low prev candle - buffer
-            # Short: entry = low prev candle, SL = high prev candle + buffer
+            # SL selalu dari candle SEBELUM engulfing (prev candle): Long SL = low prev - buffer,
+            # Short SL = high prev + buffer. Entry: FVG = 50% range candle ENGULFING itu sendiri,
+            # IDM = high/low candle SEBELUM engulfing (perilaku lama, tak berubah).
             prev_c_hi = float(df_m5['high'].iloc[i-1])
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
-                entry_p  = prev_c_hi
+                entry_p  = (hi + lo) / 2.0 if is_fvg else prev_c_hi
                 sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
-                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
-                entry_p  = prev_c_lo
+                entry_p  = (hi + lo) / 2.0 if is_fvg else prev_c_lo
                 sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
-                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [prev candle hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
@@ -2303,7 +2342,7 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
             hangus = (stype == 'Long'  and lo_now <= c3_trig - cancel_dist) or                      (stype == 'Short' and hi_now >= c3_trig + cancel_dist)
             if hangus:
                 print(f"🚫 {coin} {stype}: FVG hangus — harga lari "
-                      f">={FVG_CANCEL_RANGE_PCT*100:.0f}% range BOS dari C1 close "
+                      f">={FVG_CANCEL_RANGE_PCT*100:.0f}% range BOS dari trigger1 "
                       f"({c3_trig:.6g}) ke arah BOS tanpa engulfing.")
                 return 'remove'
 
@@ -2312,16 +2351,16 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
         entry = setup['entry']; dist = setup['dist']
         side_order = "Buy" if stype == "Long" else "Sell"
 
-        # ── PATH A: FVG monitor M5 setelah C3 ujung tersentuh ──
-        # Tidak pakai APPROACH_R. Monitor dimulai begitu C3 ujung tersentuh di M5.
+        # ── PATH A: FVG monitor M5 setelah trigger1 (ujung gap) tersentuh ──
+        # Tidak pakai APPROACH_R. Monitor dimulai begitu trigger1 tersentuh di M5.
         if M5_ENGULF_FILTER and df_m5 is not None:
             c3_trig = float(setup.get('orig_ocl', entry))
             bos_rng = float(setup.get('bos_rng') or abs(float(setup.get('peak_val') or 0) - float(setup.get('choch_level') or 0)))
             if setup.get('m5_c1c_touched'):
-                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} C1.close:{c3_trig:.6f} | monitor engulfing M5...")
+                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} trigger1:{c3_trig:.6f} | monitor engulfing M5...")
             else:
                 _pct_fvg = abs(curr_price - c3_trig) / c3_trig * 100 if c3_trig else 0
-                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} C1.close:{c3_trig:.6f} | "
+                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} trigger1:{c3_trig:.6f} | "
                       f"menunggu sentuhan ({_pct_fvg:.2f}% lagi)")
             active_count = len(active_positions) + _count_slots()
             if active_count >= MAX_CONCURRENT:
