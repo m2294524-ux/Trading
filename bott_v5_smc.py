@@ -512,7 +512,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.00    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.01    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -1230,16 +1230,20 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
             continue   # trigger sudah pernah disentuh sebelum bot jalan → skip, tidak fresh
 
         # Cek sweep dari candle M5 setelah puncak DAN setelah bot_start_ts (live)
+        # HANYA candle CLOSED yang dipakai (candle terakhir/iloc[-1] masih berjalan,
+        # OHLC-nya bisa berubah, dan low/high-nya BELUM final).
         m5_after = df_m5[(df_m5['ts'] > ts_hi) & (df_m5['ts'] >= bot_start_ms)]
-        if len(m5_after) == 0:
+        if len(m5_after) < 2:
             continue
+        m5_after_closed = m5_after.iloc[:-1]   # buang candle yg masih berjalan
+        # Ambil baris LANGSUNG dari hasil filter (bukan df_m5.loc[breaches[0]] via index terpisah
+        # -> pernah kejadian salah ambil candle SEBELUM sweep asli, kemungkinan isu alignment index).
         if stype == "Long":
-            breaches = m5_after.index[m5_after['low'] <= prot]
+            breach_rows = m5_after_closed[m5_after_closed['low'] <= prot]
         else:
-            breaches = m5_after.index[m5_after['high'] >= prot]
-        last_closed_idx = df_m5.index[-2]
-        if len(breaches) == 0:
-            continue                       # IDM belum disapu sejak bot jalan -> tunggu
+            breach_rows = m5_after_closed[m5_after_closed['high'] >= prot]
+        if breach_rows.empty:
+            continue                       # IDM belum disapu (closed) sejak bot jalan -> tunggu
         # Sweep terjadi live setelah bot jalan → masuk idm_pending.
         sig = (stype, round(a['choch_level'], 10), round(a['swing_val'], 10))
         if inducement_done.get((coin, stype)) == sig:
@@ -1249,7 +1253,12 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
         else:
             side, e_stype = "Buy", "Long"
         curr = float(df_m5.iloc[-1]['close'])
-        trig = df_m5.iloc[-2]              # candle M5 yg menyapu (closed terakhir)
+        trig = breach_rows.iloc[0]         # candle M5 yg BENAR-BENAR menyapu trigger (closed, pertama)
+        # Guard defensif: pastikan trig yg kepilih memang betul2 menyapu prot. Kalau tidak,
+        # ini indikasi bug serupa lagi -> skip drpd lanjut dgn data yg salah.
+        if (stype == "Long" and float(trig['low']) > prot) or (stype == "Short" and float(trig['high']) < prot):
+            print(f"⚠️ {coin}: IDM {stype} trig candle tidak valid (low/high tak menyapu prot={prot:.6g}), skip.")
+            continue
         sl_dist = SL_CAP_RANGE * rng
         if _akey(coin, e_stype) in active_positions or _akey(coin, e_stype) in idm_pending:
             continue                       # sisi IDM ini sudah terbuka / limit sudah terpasang
@@ -2175,6 +2184,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             lo = float(df_m5['low'].iloc[i])
             hi = float(df_m5['high'].iloc[i])
             cl = float(df_m5['close'].iloc[i])
+            op = float(df_m5['open'].iloc[i])
 
             # Masuk range_base jika candle masih dalam range fokus (tidak melewati hi atau lo)
             if not range_base and hi < f_hi and lo > f_lo:
@@ -2189,23 +2199,26 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             short_sweep_opp = (hi >= f_hi)
 
             # SL dari candle SEBELUM engulfing (prev candle): Long SL = low prev - buffer,
-            # Short SL = high prev + buffer. Entry (FVG maupun IDM) = 50% range candle ENGULFING itu sendiri.
+            # Short SL = high prev + buffer. Entry (FVG maupun IDM) = 50% BODY candle ENGULFING
+            # itu sendiri (open-close, wick TIDAK dihitung).
             prev_c_hi = float(df_m5['high'].iloc[i-1])
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
-                entry_p  = (hi + lo) / 2.0
+                entry_p  = (op + cl) / 2.0
                 sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
-                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
+                      f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
-                entry_p  = (hi + lo) / 2.0
+                entry_p  = (op + cl) / 2.0
                 sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
-                      f"→ entry={entry_p:.6g} SL={sl_price:.6g} [candle engulf hi={hi:.6g} lo={lo:.6g}, prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
+                      f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
