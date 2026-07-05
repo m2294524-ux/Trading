@@ -178,7 +178,7 @@ MAX_CONCURRENT   = 12     # PLAFON KEAMANAN posisi bersamaan (backstop). Pembata
 APPROACH_R       = 2.0    # place limit saat harga dalam 1R dari entry (ujung wick C2)
 REQUIRE_BOS      = True   # SMC inti: WAJIB BOS H1 dulu
 SL_FRAC          = 1.0    # SL penuh di invalidation C1 low/high (standar SMC)
-SL_CAP_RANGE     = 0.01   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANGE)
+SL_CAP_RANGE     = 0.00   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANGE)
 SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False = SL ikut C1, di-cap 10% range
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
@@ -512,7 +512,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.01    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.00    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2092,6 +2092,16 @@ def _count_slots():
     return nf
 
 
+def _ts_wib(ts_ms):
+    """Konversi epoch ms (UTC) ke string waktu WIB, buat label log."""
+    import datetime
+    try:
+        return (datetime.datetime.utcfromtimestamp(int(ts_ms) / 1000)
+                + datetime.timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return str(ts_ms)
+
+
 def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     """Monitor M5 setelah C1 close H1 tersentuh. Cari konfirmasi engulfing untuk market order.
     Return: dict {'entry': float, 'sl': float, 'side': str} jika engulfing terkonfirmasi,
@@ -2169,8 +2179,8 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 setup['m5_focus_hi']  = hi
                 setup['m5_focus_lo']  = lo
                 setup['m5_focus_idx'] = i
-                print(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 idx={i} "
-                      f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
+                log_entry(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
                 break
         if not setup.get('m5_trigger2_touched'):
             return None   # trigger2 belum tersentuh
@@ -2189,7 +2199,8 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             # Masuk range_base jika candle masih dalam range fokus (tidak melewati hi atau lo)
             if not range_base and hi < f_hi and lo > f_lo:
                 range_base = True
-                print(f"   {coin} {stype}: range base mode aktif idx={i}")
+                log_entry(f"   {coin} {stype}: range base mode aktif @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"(candle base hi={f_hi:.6g} lo={f_lo:.6g})")
 
             # ── Cek engulfing ──
             # Engulfing valid: close melewati hi/lo fokus DAN tidak sweep sisi berlawanan sekaligus
@@ -2206,22 +2217,32 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
                 entry_p  = (op + cl) / 2.0
-                sl_price = prev_c_lo - SL_ENGULF_PCT * bos_rng
+                sl_raw   = prev_c_lo
+                sl_buf   = SL_ENGULF_PCT * bos_rng
+                sl_price = sl_raw - sl_buf
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
                       f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
                       f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
-                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
+                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo,
+                        'engulf_ohlc': {'open': op, 'high': hi, 'low': lo, 'close': cl},
+                        'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
+                        'sl_raw': sl_raw, 'sl_buffer': sl_buf}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
                 entry_p  = (op + cl) / 2.0
-                sl_price = prev_c_hi + SL_ENGULF_PCT * bos_rng
+                sl_raw   = prev_c_hi
+                sl_buf   = SL_ENGULF_PCT * bos_rng
+                sl_price = sl_raw + sl_buf
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
                       f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
                       f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
-                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo}
+                        'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo,
+                        'engulf_ohlc': {'open': op, 'high': hi, 'low': lo, 'close': cl},
+                        'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
+                        'sl_raw': sl_raw, 'sl_buffer': sl_buf}
 
             # ── Update fokus ──
             if range_base:
@@ -2250,7 +2271,8 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 setup['m5_focus_hi']  = hi; setup['m5_focus_lo']  = lo
                 setup['m5_focus_idx'] = i
                 range_base = False   # reset ke mode normal setelah pindah fokus
-                print(f"   {coin} {stype}: fokus pindah ke M5 idx={i} hi={hi:.6g} lo={lo:.6g}")
+                log_entry(f"   {coin} {stype}: fokus pindah ke M5 {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
 
         return None   # belum ada engulfing di data yang tersedia
 
@@ -2271,8 +2293,8 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
         trig2 = r['sl']   # SL dari engulfing pendahuluan = trigger2 (level retest)
         setup['m5_fvg_trigger2'] = trig2
         setup['m5_fvg_trigger2_touched'] = False
-        print(f"   {coin} {stype}: engulfing PENDAHULUAN idx={r['engulf_idx']} (SL={trig2:.6g}) "
-              f"→ ini BUKAN entry, tunggu retest trigger2 dulu sebelum cari engulfing BENERAN")
+        log_entry(f"   {coin} {stype}: engulfing PENDAHULUAN @ {_ts_wib(df_m5['ts'].iloc[r['engulf_idx']]) if 'ts' in df_m5.columns else r['engulf_idx']} "
+                  f"(SL={trig2:.6g}) → ini BUKAN entry, tunggu retest trigger2 dulu sebelum cari engulfing BENERAN")
         # fall-through: langsung cek retest di data yang sama kalau tersedia (tidak return dulu)
 
     # Tahap retest: trigger2 sudah ada, tapi belum tersentuh candle SETELAH engulfing pendahuluan
@@ -2292,8 +2314,8 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
         setup['m5_focus_hi']  = float(df_m5['high'].iloc[hit_idx])
         setup['m5_focus_lo']  = float(df_m5['low'].iloc[hit_idx])
         setup['m5_focus_idx'] = hit_idx
-        print(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 idx={hit_idx} "
-              f"hi={setup['m5_focus_hi']:.6g} lo={setup['m5_focus_lo']:.6g} — mulai monitor engulfing BENERAN")
+        log_entry(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 {_ts_wib(df_m5['ts'].iloc[hit_idx]) if 'ts' in df_m5.columns else hit_idx} "
+                  f"hi={setup['m5_focus_hi']:.6g} lo={setup['m5_focus_lo']:.6g} — mulai monitor engulfing BENERAN")
         # fall-through: langsung cek engulfing beneran di data yang sama kalau tersedia
 
     # Tahap B: cari engulfing BENERAN (baru sampai sini kalau trigger2 sudah tersentuh) -> ini yang dieksekusi
@@ -2393,6 +2415,17 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                     print(f"\U0001f4cd {coin} {stype}: ENGULFING M5 → LIMIT @ {limit_entry:.6f} "
                           f"SL:{limit_sl:.6f} | break:{setup.get('swing_val'):.6g} "
                           f"puncak:{setup.get('peak_val'):.6g}")
+                    _eo = engulf.get('engulf_ohlc', {})
+                    _so = engulf.get('sl_candle_ohlc', {})
+                    log_entry(
+                        f"════ FVG ENGULF LIMIT {stype} {coin} @ {limit_entry:.6g} ════\n"
+                        f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
+                        f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
+                        f"→ entry 50% body = {limit_entry:.6g}\n"
+                        f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
+                        f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
+                        f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
+                    )
                     return 'lock'
             return 'keep'
         # ── PATH B: Fallback limit (M5_ENGULF_FILTER=False) ──
@@ -2627,7 +2660,17 @@ def check_idm_pending():
                     p['phase']    = 'WAIT_FILL'   # tandai sudah punya limit
                     print(f"\U0001f4cd {coin}: IDM M5 ENGULF {e_stype_idm} → LIMIT @ {limit_entry:.6g} "
                           f"SL:{limit_sl:.6g}")
-                    log_entry(f"════ IDM M5 ENGULF LIMIT {e_stype_idm} {coin} @ {limit_entry:.6g} ════")
+                    _eo = engulf.get('engulf_ohlc', {})
+                    _so = engulf.get('sl_candle_ohlc', {})
+                    log_entry(
+                        f"════ IDM M5 ENGULF LIMIT {e_stype_idm} {coin} @ {limit_entry:.6g} ════\n"
+                        f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
+                        f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
+                        f"→ entry 50% body = {limit_entry:.6g}\n"
+                        f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
+                        f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
+                        f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
+                    )
             continue   # M5 engulf path selesai, lanjut ke key berikutnya
 
         # ── INVALIDASI PERGERAKAN (mode limit lama) ──
