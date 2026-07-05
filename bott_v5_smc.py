@@ -2113,8 +2113,9 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
 
     FILTER EMA20 (FVG maupun IDM): begitu ada candle yg memenuhi syarat engulfing (4 aturan dasar),
     dicek dulu apakah salah satu dari 3 candle SEBELUM candle engulfing itu sudah menyentuh EMA20 M5
-    (Short: high candle >= EMA20 candle itu / EMA di atas harga = tren bearish; Long: low candle <=
-    EMA20 candle itu / EMA di bawah harga = tren bullish). Kalau tidak ada satupun yg menyentuh,
+    (EMA20 candle itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma
+    "high>=ema"/"low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung
+    tersentuh). Kalau tidak ada satupun yg menyentuh,
     engulfing itu DITOLAK (bukan entry) — fokus tetap pindah ke candle itu dan monitor lanjut cari
     engulfing BERIKUTNYA (bisa berkali-kali sampai ketemu yg lolos syarat EMA).
     """
@@ -2187,17 +2188,19 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             return None   # trigger2 belum tersentuh
 
     def _ema_touched(i):
-        """3 candle SEBELUM candle engulfing (i-3..i-1): minimal 1 harus menyentuh EMA20.
-        Short -> EMA di atas harga (bearish), disentuh dari bawah: high candle >= EMA20 candle itu.
-        Long  -> EMA di bawah harga (bullish), disentuh dari atas: low candle <= EMA20 candle itu.
-        Kesentuh = persis atau melebihi (>=/<=), bukan harus persis pas."""
+        """3 candle SEBELUM candle engulfing (i-3..i-1): minimal 1 harus BENAR-BENAR menyentuh
+        EMA20 — nilai EMA20 candle itu harus masuk ke dalam range candle (low<=ema<=high).
+        Ini BUKAN sekadar 'high>=ema' atau 'low<=ema' saja, karena kalau harga sudah lama berada
+        jauh di satu sisi EMA (mis. rally panjang di atas EMA yang lamban), high>=ema akan SELALU
+        true meski tidak pernah ada sentuhan beneran ke garis EMA-nya. Dicek dengan candle range
+        yang memuat nilai EMA supaya valid untuk kedua arah (Long maupun Short)."""
         if 'ema20' not in df_m5.columns:
             return True
         for j in range(max(0, i - 3), i):
             ema_j = float(df_m5['ema20'].iloc[j])
-            if stype == 'Long' and float(df_m5['low'].iloc[j]) <= ema_j:
-                return True
-            if stype == 'Short' and float(df_m5['high'].iloc[j]) >= ema_j:
+            lo_j  = float(df_m5['low'].iloc[j])
+            hi_j  = float(df_m5['high'].iloc[j])
+            if lo_j <= ema_j <= hi_j:
                 return True
         return False
 
