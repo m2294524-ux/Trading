@@ -512,7 +512,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.02    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.01    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2111,13 +2111,16 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     harus disentuh CANDLE SETELAHNYA dulu sebelum mulai cari engulfing.
     FVG: tidak ada trigger2 lagi (1x engulfing, sama seperti IDM) — filternya EMA20 (lihat bawah).
 
-    FILTER EMA20 (FVG maupun IDM): begitu ada candle yg memenuhi syarat engulfing (4 aturan dasar),
-    dicek dulu apakah salah satu dari 3 candle SEBELUM candle engulfing itu sudah menyentuh EMA20 M5
-    (EMA20 candle itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma
-    "high>=ema"/"low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung
-    tersentuh). Kalau tidak ada satupun yg menyentuh,
-    engulfing itu DITOLAK (bukan entry) — fokus tetap pindah ke candle itu dan monitor lanjut cari
-    engulfing BERIKUTNYA (bisa berkali-kali sampai ketemu yg lolos syarat EMA).
+    FILTER EMA20 (FVG maupun IDM), dua syarat, keduanya harus lolos:
+      1. Salah satu dari 3 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
+         itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma "high>=ema"/
+         "low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung tersentuh).
+      2. Candle ENGULFING itu sendiri harus close di sisi EMA20 yang benar: Long → close di ATAS
+         EMA20 candle itu; Short → close di BAWAH EMA20 candle itu.
+    Kalau salah satu syarat gagal, engulfing itu DITOLAK (bukan entry) — fokus_hi/lo TETAP di level
+    lama (TIDAK digeser ke candle yang ditolak, supaya candle berikutnya tidak trivially "engulfing
+    lagi" hanya karena kelanjutan momentum yang sama) dan monitor lanjut cari engulfing BERIKUTNYA
+    (bisa berkali-kali sampai ketemu yang lolos kedua syarat EMA).
     """
     if df_m5 is None or len(df_m5) < 2:
         return None
@@ -2233,12 +2236,23 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
+                ema_i = float(df_m5['ema20'].iloc[i])
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — lanjut cari engulfing berikutnya")
-                    f_hi = hi; f_lo = lo
-                    setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
-                    range_base = False
+                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — fokus TETAP {f_hi:.6g}/{f_lo:.6g}, "
+                              f"lanjut cari engulfing berikutnya")
+                    # Fokus SENGAJA TIDAK digeser ke candle yg ditolak ini — kalau digeser, candle
+                    # berikutnya cuma perlu close sedikit di atas candle ditolak ini utk "engulfing lagi"
+                    # (kelanjutan momentum yg sama, bukan breakout independen baru). Fokus_hi/lo tetap
+                    # di level lama; hanya posisi scan yg maju (biar tidak reprocess candle yg sama
+                    # tiap tick berikutnya).
+                    setup['m5_focus_idx'] = i
+                    continue
+                if not (cl > ema_i):
+                    log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                              f"DITOLAK (close={cl:.6g} tidak di atas EMA20={ema_i:.6g}) — fokus TETAP "
+                              f"{f_hi:.6g}/{f_lo:.6g}, lanjut cari engulfing berikutnya")
+                    setup['m5_focus_idx'] = i
                     continue
                 entry_p  = (op + cl) / 2.0
                 sl_raw   = prev_c_lo
@@ -2254,12 +2268,21 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                         'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
                         'sl_raw': sl_raw, 'sl_buffer': sl_buf}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
+                ema_i = float(df_m5['ema20'].iloc[i])
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — lanjut cari engulfing berikutnya")
-                    f_hi = hi; f_lo = lo
-                    setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
-                    range_base = False
+                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — fokus TETAP {f_hi:.6g}/{f_lo:.6g}, "
+                              f"lanjut cari engulfing berikutnya")
+                    # Sama seperti Long: fokus_hi/lo TIDAK digeser ke candle yg ditolak (supaya candle
+                    # berikutnya tidak trivially "engulfing lagi" hanya krn kelanjutan momentum sama),
+                    # tapi posisi scan tetap maju biar tidak reprocess candle yg sama tiap tick.
+                    setup['m5_focus_idx'] = i
+                    continue
+                if not (cl < ema_i):
+                    log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                              f"DITOLAK (close={cl:.6g} tidak di bawah EMA20={ema_i:.6g}) — fokus TETAP "
+                              f"{f_hi:.6g}/{f_lo:.6g}, lanjut cari engulfing berikutnya")
+                    setup['m5_focus_idx'] = i
                     continue
                 entry_p  = (op + cl) / 2.0
                 sl_raw   = prev_c_hi
@@ -2445,14 +2468,10 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
 
     # ── WAIT_FILL ──
     if setup['phase'] == 'WAIT_FILL':
-        entry_w = setup['entry']; dist_w = setup['dist']; thr_w = APPROACH_R * dist_w
-        price_away = (stype == 'Long'  and curr_price > entry_w + thr_w) or \
-                     (stype == 'Short' and curr_price < entry_w - thr_w)
-        if price_away:
-            if setup.get('order_id'): cancel_order(coin, setup['order_id'])
-            setup['phase'] = 'WAIT_APPROACH'; setup.pop('order_id', None)
-            print(f"📤 {coin} {stype}: Limit dibatalkan (harga mundur > {APPROACH_R}R). Menunggu lagi.")
-            return 'keep'
+        # NB: sebelumnya di sini ada cancel kalau harga lari >APPROACH_R×dist dari entry.
+        # Sudah dihapus atas permintaan — limit FVG SEKARANG hanya dibatalkan kalau BOS baru
+        # terdeteksi di H1 (swing_val berubah), bukan karena harga lari jauh. Lihat run_bot loop
+        # (blok "Re-deteksi DUA ARAH") untuk logika pembatalan BOS-baru itu.
         pos = get_open_position(coin, 'Buy' if stype == 'Long' else 'Sell')
         if pos:
             entry_p = setup['entry']; sl_p = setup['sl']
@@ -2801,13 +2820,14 @@ def run_bot():
                     if filled:
                         pending.pop(coin, None)
                         continue
-                    # Re-deteksi DUA ARAH: tambah/ganti di arah yg masih WAIT_APPROACH atau belum ada
+                    # Re-deteksi DUA ARAH: tambah/ganti di arah yg masih WAIT_APPROACH atau belum ada.
+                    # WAIT_FILL TIDAK lagi di-skip total — tetap dicek BOS baru, dan limit yg sudah
+                    # terpasang dibatalkan HANYA kalau BOS-nya memang sudah berganti (swing_val beda),
+                    # bukan lagi karena harga lari jauh (>2R) dari entry.
                     for d in ('Long', 'Short'):
                         if ALLOW_HEDGE and _akey(coin, d) in active_positions:
                             continue   # hedge: arah ini posisinya sudah terbuka -> jangan pasang limit lagi
                         cur = dirs.get(d)
-                        if cur is not None and cur.get('phase') == 'WAIT_FILL':
-                            continue   # arah terkunci (limit terpasang)
                         cand, cand_log = build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=False, force_dir=d)
                         if not cand:
                             continue
@@ -2815,12 +2835,18 @@ def run_bot():
                             print(f"➕ {coin} {d}: BOS {d} terdeteksi — tambah pantauan")
                             print(cand_log); dirs[d] = cand
                         elif cand['swing_val'] != cur.get('swing_val'):
-                            print(f"🔁 {coin} {d}: BOS lebih baru — ganti (break {cur.get('swing_val')} → {cand['swing_val']:.6g})")
+                            if cur.get('phase') == 'WAIT_FILL' and cur.get('order_id'):
+                                cancel_order(coin, cur['order_id'])
+                                print(f"🚫 {coin} {d}: limit dibatalkan — BOS baru terdeteksi di H1 "
+                                      f"(break {cur.get('swing_val')} → {cand['swing_val']:.6g})")
+                            else:
+                                print(f"🔁 {coin} {d}: BOS lebih baru — ganti (break {cur.get('swing_val')} → {cand['swing_val']:.6g})")
                             print(cand_log); dirs[d] = cand
-                        else:
-                            # arah & swing sama -> segarkan swing2/FVG (tanpa log) agar invalidasi akurat
+                        elif cur.get('phase') != 'WAIT_FILL':
+                            # arah & swing sama, belum terkunci -> segarkan swing2/FVG (tanpa log)
                             cur['swing2'] = cand.get('swing2'); cur['peak_val'] = cand.get('peak_val')
                             cur['choch_level'] = cand.get('choch_level'); cur['fvg_list'] = cand.get('fvg_list', cur.get('fvg_list'))
+                        # kalau WAIT_FILL dan swing_val SAMA (BOS belum berganti) -> biarkan, jangan diutak-atik
                     if not dirs:
                         pending.pop(coin, None)
                     continue
