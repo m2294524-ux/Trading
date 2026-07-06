@@ -512,7 +512,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.01    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.00    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -1288,19 +1288,13 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'trigger': prot, 'rng': rng, 'sl_dist': sl_dist,
                     'swing_val': a['swing_val'], 'choch_level': a['choch_level'],
                     'peak_val': a['peak_val'], 'bos_type': e_stype,
-                    # M5 monitor state
-                    # `trig` = candle M5 yang SUDAH TERBUKTI menyapu trigger H1 (closed terakhir,
-                    # lihat definisi di atas). Sebelumnya trigger2 dibiarkan None dan di-re-scan dari
-                    # nol oleh check_m5_engulfing() pakai level H1 mentah (prot) -> salah candle acuan
-                    # (bisa nemu candle JAUH setelah sweep asli, karena candle sweep asli sendiri
-                    # sudah lewat filter created_ts). Sekarang di-seed langsung dari candle sweep asli
-                    # agar Tahap 1 (touch trigger H1) tidak diulang -> langsung ke Tahap 2 (tunggu
-                    # trigger2 disentuh candle SETELAHNYA).
+                    # M5 monitor state — `trig` = candle M5 yang SUDAH TERBUKTI menyapu trigger H1
+                    # (closed terakhir). Langsung jadi fokus pertama (sama seperti FVG) — TIDAK ADA
+                    # LAGI trigger2/tunggu candle setelahnya. Validasi kualitas diserahkan ke filter
+                    # EMA20 di check_m5_engulfing.
                     'm5_triggered': True,   # sentuhan trigger H1 sudah pasti terjadi di candle `trig`
-                    'm5_trigger2': float(trig['high']) if e_stype == 'Short' else float(trig['low']),
-                    'm5_trigger2_touched': False,  # apakah trigger2 sudah disentuh candle SETELAH `trig`
                     'm5_focus_hi': float(trig['high']), 'm5_focus_lo': float(trig['low']),
-                    'm5_focus_idx': -1,   # -1 -> pencarian trigger2 mulai dari candle PERTAMA setelah `trig`
+                    'm5_focus_idx': -1,
                     'm5_hangus': False,
                 }
                 inducement_done[(coin, stype)] = sig
@@ -1311,9 +1305,8 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     f"puncak={a['peak_val'] if a['peak_val'] is not None else a['B']:.6g} range={rng:.6g}\n"
                     f"  IDM trigger={prot:.6g}@{idm['prot_idx']} | batal jika >±{IDM_CANCEL_RANGE_PCT*100:.0f}% range\n"
                     f"  SWEEP CANDLE M5 (trig): ts={int(trig['ts'])} low={float(trig['low']):.6g} "
-                    f"high={float(trig['high']):.6g} close={float(trig['close']):.6g} → "
-                    f"trigger2={idm_pending[_akey(coin, e_stype)]['m5_trigger2']:.6g} "
-                    f"(tunggu candle SETELAHNYA menyentuh trigger2)"
+                    f"high={float(trig['high']):.6g} close={float(trig['close']):.6g} — langsung jadi "
+                    f"fokus pertama, mulai cari engulfing"
                 )
                 log_entry(rec)
                 if (not ALLOW_HEDGE) and coin in pending:
@@ -2098,29 +2091,33 @@ def _ts_wib(ts_ms):
 
 
 def check_m5_engulfing(coin, setup, df_m5, bos_rng):
-    """Monitor M5 setelah C1 close H1 tersentuh. Cari konfirmasi engulfing untuk market order.
+    """Monitor M5 setelah trigger H1 tersentuh (C1 close untuk FVG lama / ujung gap utk FVG /
+    trigger IDM). Cari konfirmasi engulfing untuk market order.
     Return: dict {'entry': float, 'sl': float, 'side': str} jika engulfing terkonfirmasi,
             None jika belum ada konfirmasi.
     State disimpan di setup dict:
-      'm5_c1c_touched' : bool  — apakah C1 close H1 sudah tersentuh di M5
+      'm5_c1c_touched' : bool  — apakah trigger H1 sudah tersentuh di M5
       'm5_focus_hi'    : float — high candle fokus aktif
       'm5_focus_lo'    : float — low candle fokus aktif
       'm5_focus_idx'   : int   — index candle fokus di df_m5
 
-    IDM ('m5_trigger2' ada di setup): trigger2 = low/high candle yg menyapu trigger H1 IDM,
-    harus disentuh CANDLE SETELAHNYA dulu sebelum mulai cari engulfing.
-    FVG: tidak ada trigger2 lagi (1x engulfing, sama seperti IDM) — filternya EMA20 (lihat bawah).
+    IDM dan FVG sekarang SAMA PERSIS: begitu trigger H1 tersentuh, candle M5 pertama yang
+    menyentuhnya LANGSUNG jadi fokus pertama — tidak ada lagi trigger2/tunggu candle kedua.
+    Validasi kualitas sinyal sepenuhnya diserahkan ke filter EMA20 di bawah.
 
-    FILTER EMA20 (FVG maupun IDM), dua syarat, keduanya harus lolos:
+    FILTER EMA20 (FVG maupun IDM), TIGA syarat, semuanya harus lolos:
       1. Salah satu dari 3 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
          itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma "high>=ema"/
          "low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung tersentuh).
       2. Candle ENGULFING itu sendiri harus close di sisi EMA20 yang benar: Long → close di ATAS
          EMA20 candle itu; Short → close di BAWAH EMA20 candle itu.
-    Kalau salah satu syarat gagal, engulfing itu DITOLAK (bukan entry) — fokus_hi/lo TETAP di level
-    lama (TIDAK digeser ke candle yang ditolak, supaya candle berikutnya tidak trivially "engulfing
-    lagi" hanya karena kelanjutan momentum yang sama) dan monitor lanjut cari engulfing BERIKUTNYA
-    (bisa berkali-kali sampai ketemu yang lolos kedua syarat EMA).
+      3. Candle SEBELUM engulfing (i-1): body-nya (open-close, bukan wick) harus ada bagian yang
+         keluar searah EMA — Long: max(open,close) candle i-1 > EMA20 candle i-1 (body pernah di
+         atas EMA); Short: min(open,close) candle i-1 < EMA20 candle i-1 (body pernah di bawah EMA).
+    Kalau salah satu dari 3 syarat gagal, engulfing itu DITOLAK (bukan entry) — TAPI candle yang
+    ditolak itu tetap jadi fokus baru (persis seperti aturan dasar pindah fokus biasa — close yang
+    melewati fokus lama selalu memindahkan fokus, terlepas apakah akhirnya lolos jadi entry atau
+    tidak), dan monitor lanjut cari engulfing BERIKUTNYA dari fokus baru itu.
     """
     if df_m5 is None or len(df_m5) < 2:
         return None
@@ -2156,39 +2153,11 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 setup['m5_focus_hi']    = hi
                 setup['m5_focus_lo']    = lo
                 setup['m5_focus_idx']   = i
-                # Trigger2 untuk IDM: saat trigger H1 tersapu, low candle (Long) atau
-                # high candle (Short) jadi level ke-2 yang harus disentuh dulu sebelum engulfing.
-                # Hanya aktif kalau setup punya field 'm5_trigger2' (IDM mode, bukan FVG).
-                if 'm5_trigger2' in setup:
-                    trig2 = lo if stype == 'Long' else hi
-                    setup['m5_trigger2'] = trig2
-                    print(f"   {coin} {stype}: trigger H1 ({c1c:.6g}) tersapu M5 idx={i} "
-                          f"hi={hi:.6g} lo={lo:.6g} → trigger2={trig2:.6g} — tunggu trigger2")
-                else:
-                    print(f"   {coin} {stype}: C1 close ({c1c:.6g}) tersentuh M5 idx={i} "
-                          f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
+                print(f"   {coin} {stype}: trigger H1 ({c1c:.6g}) tersentuh M5 idx={i} "
+                      f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
                 break
         if not setup.get('m5_c1c_touched'):
             return None   # belum tersentuh
-
-    # Untuk IDM: jika trigger2 ada dan belum tersentuh, tunggu dulu
-    if setup.get('m5_trigger2') is not None and not setup.get('m5_trigger2_touched', True):
-        trig2 = float(setup['m5_trigger2'])
-        for i in range(setup.get('m5_focus_idx', 0) + 1, closed_end):
-            lo = float(df_m5['low'].iloc[i])
-            hi = float(df_m5['high'].iloc[i])
-            hit2 = (stype == 'Long' and lo <= trig2) or (stype == 'Short' and hi >= trig2)
-            if hit2:
-                setup['m5_trigger2_touched'] = True
-                # Candle yang menyentuh trigger2 jadi fokus baru
-                setup['m5_focus_hi']  = hi
-                setup['m5_focus_lo']  = lo
-                setup['m5_focus_idx'] = i
-                log_entry(f"   {coin} {stype}: trigger2 ({trig2:.6g}) tersentuh M5 {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                          f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
-                break
-        if not setup.get('m5_trigger2_touched'):
-            return None   # trigger2 belum tersentuh
 
     def _ema_touched(i):
         """3 candle SEBELUM candle engulfing (i-3..i-1): minimal 1 harus BENAR-BENAR menyentuh
@@ -2236,23 +2205,27 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
             if stype == 'Long' and cl > f_hi and not long_sweep_opp and not range_base:
-                ema_i = float(df_m5['ema20'].iloc[i])
+                ema_i    = float(df_m5['ema20'].iloc[i])
+                ema_prev = float(df_m5['ema20'].iloc[i-1])
+                rejected = False
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — fokus TETAP {f_hi:.6g}/{f_lo:.6g}, "
-                              f"lanjut cari engulfing berikutnya")
-                    # Fokus SENGAJA TIDAK digeser ke candle yg ditolak ini — kalau digeser, candle
-                    # berikutnya cuma perlu close sedikit di atas candle ditolak ini utk "engulfing lagi"
-                    # (kelanjutan momentum yg sama, bukan breakout independen baru). Fokus_hi/lo tetap
-                    # di level lama; hanya posisi scan yg maju (biar tidak reprocess candle yg sama
-                    # tiap tick berikutnya).
-                    setup['m5_focus_idx'] = i
-                    continue
-                if not (cl > ema_i):
+                              f"DITOLAK (3 candle sebelum tak sentuh EMA20)")
+                    rejected = True
+                elif not (cl > ema_i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (close={cl:.6g} tidak di atas EMA20={ema_i:.6g}) — fokus TETAP "
-                              f"{f_hi:.6g}/{f_lo:.6g}, lanjut cari engulfing berikutnya")
-                    setup['m5_focus_idx'] = i
+                              f"DITOLAK (close={cl:.6g} tidak di atas EMA20={ema_i:.6g})")
+                    rejected = True
+                elif not (max(float(df_m5['open'].iloc[i-1]), float(df_m5['close'].iloc[i-1])) > ema_prev):
+                    log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                              f"DITOLAK (body candle sebelum engulfing tidak pernah di atas EMA20={ema_prev:.6g})")
+                    rejected = True
+                if rejected:
+                    # Candle yang ditolak TETAP jadi fokus baru (aturan dasar biasa: close melewati
+                    # fokus lama = pindah fokus), lalu lanjut cari engulfing berikutnya dari sini.
+                    f_hi = hi; f_lo = lo
+                    setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
+                    range_base = False
                     continue
                 entry_p  = (op + cl) / 2.0
                 sl_raw   = prev_c_lo
@@ -2268,21 +2241,27 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                         'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
                         'sl_raw': sl_raw, 'sl_buffer': sl_buf}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
-                ema_i = float(df_m5['ema20'].iloc[i])
+                ema_i    = float(df_m5['ema20'].iloc[i])
+                ema_prev = float(df_m5['ema20'].iloc[i-1])
+                rejected = False
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20) — fokus TETAP {f_hi:.6g}/{f_lo:.6g}, "
-                              f"lanjut cari engulfing berikutnya")
-                    # Sama seperti Long: fokus_hi/lo TIDAK digeser ke candle yg ditolak (supaya candle
-                    # berikutnya tidak trivially "engulfing lagi" hanya krn kelanjutan momentum sama),
-                    # tapi posisi scan tetap maju biar tidak reprocess candle yg sama tiap tick.
-                    setup['m5_focus_idx'] = i
-                    continue
-                if not (cl < ema_i):
+                              f"DITOLAK (3 candle sebelum tak sentuh EMA20)")
+                    rejected = True
+                elif not (cl < ema_i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (close={cl:.6g} tidak di bawah EMA20={ema_i:.6g}) — fokus TETAP "
-                              f"{f_hi:.6g}/{f_lo:.6g}, lanjut cari engulfing berikutnya")
-                    setup['m5_focus_idx'] = i
+                              f"DITOLAK (close={cl:.6g} tidak di bawah EMA20={ema_i:.6g})")
+                    rejected = True
+                elif not (min(float(df_m5['open'].iloc[i-1]), float(df_m5['close'].iloc[i-1])) < ema_prev):
+                    log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                              f"DITOLAK (body candle sebelum engulfing tidak pernah di bawah EMA20={ema_prev:.6g})")
+                    rejected = True
+                if rejected:
+                    # Sama seperti Long: candle yang ditolak TETAP jadi fokus baru, lanjut cari
+                    # engulfing berikutnya dari sini.
+                    f_hi = hi; f_lo = lo
+                    setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
+                    range_base = False
                     continue
                 entry_p  = (op + cl) / 2.0
                 sl_raw   = prev_c_hi
@@ -2638,8 +2617,6 @@ def check_idm_pending():
                 'type': e_stype_idm,
                 'orig_ocl': trig,
                 'm5_c1c_touched': p.get('m5_triggered', False),
-                'm5_trigger2': p.get('m5_trigger2', None),          # trigger2 (low/high candle trigger H1)
-                'm5_trigger2_touched': p.get('m5_trigger2_touched', False),
                 'm5_focus_hi': p.get('m5_focus_hi', 0.0),
                 'm5_focus_lo': p.get('m5_focus_lo', 0.0),
                 'm5_focus_idx': p.get('m5_focus_idx', 0),
@@ -2650,8 +2627,6 @@ def check_idm_pending():
             engulf = check_m5_engulfing(coin, m5_setup, df_m5_idm, bos_rng_idm)
             # Simpan state kembali ke idm_pending
             p['m5_triggered']         = m5_setup['m5_c1c_touched']
-            p['m5_trigger2']          = m5_setup.get('m5_trigger2')
-            p['m5_trigger2_touched']  = m5_setup.get('m5_trigger2_touched', False)
             p['m5_focus_hi']          = m5_setup['m5_focus_hi']
             p['m5_focus_lo']          = m5_setup['m5_focus_lo']
             p['m5_focus_idx']         = m5_setup['m5_focus_idx']
