@@ -159,8 +159,8 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 2.5    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_ACT_R      = 3.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -2198,9 +2198,10 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             long_sweep_opp  = (lo <= f_lo)
             short_sweep_opp = (hi >= f_hi)
 
-            # SL dari candle SEBELUM engulfing (prev candle): Long SL = low prev - buffer,
-            # Short SL = high prev + buffer. Entry (FVG maupun IDM) = 50% BODY candle ENGULFING
-            # itu sendiri (open-close, wick TIDAK dihitung).
+            # Entry & SL dari candle SEBELUM engulfing (prev candle) — SAMA-SAMA dari candle ini
+            # supaya jarak entry-SL proporsional & konsisten (bukan dari candle engulfing yang
+            # ukurannya bisa jauh beda). Long: entry = high prev candle, SL = low prev candle - buffer.
+            # Short: entry = low prev candle, SL = high prev candle + buffer.
             prev_c_hi = float(df_m5['high'].iloc[i-1])
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
@@ -2227,12 +2228,12 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                     setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
                     range_base = False
                     continue
-                entry_p  = (op + cl) / 2.0
+                entry_p  = prev_c_hi
                 sl_raw   = prev_c_lo
                 sl_buf   = SL_ENGULF_PCT * bos_rng
                 sl_price = sl_raw - sl_buf
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
-                      f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
+                      f"→ entry={entry_p:.6g} (high candle sebelum engulfing) SL={sl_price:.6g} "
                       f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
@@ -2263,12 +2264,12 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                     setup['m5_focus_hi'] = hi; setup['m5_focus_lo'] = lo; setup['m5_focus_idx'] = i
                     range_base = False
                     continue
-                entry_p  = (op + cl) / 2.0
+                entry_p  = prev_c_lo
                 sl_raw   = prev_c_hi
                 sl_buf   = SL_ENGULF_PCT * bos_rng
                 sl_price = sl_raw + sl_buf
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
-                      f"→ entry={entry_p:.6g} (50% body: open={op:.6g} close={cl:.6g}) SL={sl_price:.6g} "
+                      f"→ entry={entry_p:.6g} (low candle sebelum engulfing) SL={sl_price:.6g} "
                       f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
@@ -2411,7 +2412,7 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                         f"════ FVG ENGULF LIMIT {stype} {coin} @ {limit_entry:.6g} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
-                        f"→ entry 50% body = {limit_entry:.6g}\n"
+                        f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
                         f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
                         f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
                         f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
@@ -2648,7 +2649,7 @@ def check_idm_pending():
                         f"════ IDM M5 ENGULF LIMIT {e_stype_idm} {coin} @ {limit_entry:.6g} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
-                        f"→ entry 50% body = {limit_entry:.6g}\n"
+                        f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
                         f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
                         f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
                         f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
