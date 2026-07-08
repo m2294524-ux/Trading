@@ -159,7 +159,7 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
 TRAIL_ACT_R      = 3.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
@@ -183,7 +183,7 @@ SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False =
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
 INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 35% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.99 # ...sampai 60% range. (pita IDM 35-60%)
+INDUCEMENT_ZONE_HI = 0.786 # ...sampai 60% range. (pita IDM 35-60%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -500,7 +500,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.618   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
@@ -596,6 +596,30 @@ def rebreak_invalid(df, start_idx, swing2, choch_level, stype, lock_retr=0.50):
             if retraced and cl[k] < swing2:
                 return True
         return False
+
+
+def struct_touch_invalidated(df_m5, bos_stype, choch_level, peak_val):
+    """Cek candle M5 (SEMUA yang ada di window yang di-fetch, termasuk yg masih berjalan):
+    apakah wick-nya sudah menyentuh choch_level, ATAU menyentuh/melewati peak_val ke arah tren
+    BOS besar tetap berlanjut (berarti puncak belum final, struktur masih berkembang).
+    Pakai LOW/HIGH M5 (wick), bukan close H1 — supaya invalidasi terdeteksi persis saat M5
+    menyentuhnya, bukan cuma pas candle H1 close.
+    bos_stype = arah BOS BESAR ('Long'/'Short'). Return (True, alasan) / (False, None)."""
+    if df_m5 is None or len(df_m5) == 0:
+        return False, None
+    lo_min = float(df_m5['low'].min())
+    hi_max = float(df_m5['high'].max())
+    if bos_stype == "Long":
+        if choch_level is not None and lo_min <= float(choch_level):
+            return True, f"CHOCH {float(choch_level):.6g} tersentuh M5 (low={lo_min:.6g})"
+        if peak_val is not None and hi_max > float(peak_val):
+            return True, f"puncak {float(peak_val):.6g} tersentuh/lewat M5 (high={hi_max:.6g}) — tren masih lanjut"
+    else:
+        if choch_level is not None and hi_max >= float(choch_level):
+            return True, f"CHOCH {float(choch_level):.6g} tersentuh M5 (high={hi_max:.6g})"
+        if peak_val is not None and lo_min < float(peak_val):
+            return True, f"puncak {float(peak_val):.6g} tersentuh/lewat M5 (low={lo_min:.6g}) — tren masih lanjut"
+    return False, None
 
 
 def choch_is_broken(df, bos_idx, choch_level, stype):
@@ -2331,6 +2355,18 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
             if setup.get('order_id'): cancel_order(coin, setup['order_id'])
             print(f"🔄 {coin} {stype}: CHOCH {choch_level:.6f} sudah ditembus (historis). Setup batal.")
             return 'remove'
+    # CHOCH/puncak invalidation (WICK M5, real-time): beda dari cek historis di atas yang pakai
+    # CLOSE H1 — ini langsung batal begitu wick candle M5 menyentuh choch ATAU melewati puncak
+    # (tren masih lanjut, puncak belum final). Tidak perlu tunggu candle H1 close.
+    bos_stype_fvg = stype   # untuk FVG, `stype` = arah BOS besar itu sendiri
+    if df_m5 is not None and 'ts' in df_m5.columns:
+        _df_m5_chk = df_m5[df_m5['ts'] >= setup.get('created_ts', 0) * 1000]
+        invalid, why = struct_touch_invalidated(_df_m5_chk, bos_stype_fvg, choch_level, setup.get('peak_val'))
+        if invalid:
+            if setup.get('order_id'): cancel_order(coin, setup['order_id'])
+            print(f"🚫 {coin} {stype}: FVG setup batal — {why}")
+            log_entry(f"🚫 {coin} {stype}: FVG setup batal — {why}")
+            return 'remove'
     # Invalidasi struktur (historis): retrace >= RETRACE_LOCK lalu close lewati swing-2 (puncak 5-5)
     if REBREAK_INVALID:
         sw2 = setup.get('swing2')
@@ -2566,37 +2602,38 @@ def check_idm_pending():
             continue
         trig = p.get('trigger'); rng = p.get('rng')
 
-        # ── IDM WAIT_FILL: limit sudah terpasang — cancel hanya jika PUNCAK ditembus ──
+        # ── IDM WAIT_FILL: limit sudah terpasang — cancel jika CHOCH atau PUNCAK tersentuh M5 (wick) ──
         if IDM_M5_ENGULF and p.get('phase') == 'WAIT_FILL' and p.get('order_id'):
-            if p.get('peak_val'):
-                df_h1_c = get_data(coin, "60", limit=5)
-                if df_h1_c is not None and len(df_h1_c) > 0:
-                    pk = float(p['peak_val'])
-                    curr_close = float(df_h1_c['close'].iloc[-1])
-                    bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
-                    peak_broken = (bos_stype == "Long" and curr_close > pk) or                                   (bos_stype == "Short" and curr_close < pk)
-                    if peak_broken:
-                        cancel_order(coin, p['order_id'])
-                        print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — puncak {pk:.6g} ditembus")
-                        del idm_pending[key]
-                        continue
+            if p.get('peak_val') or p.get('choch_level'):
+                df_m5_c = get_data(coin, "5", limit=100)
+                if df_m5_c is not None and 'ts' in df_m5_c.columns:
+                    df_m5_c = df_m5_c[df_m5_c['ts'] >= p.get('placed_ts', 0) * 1000]
+                bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
+                invalid, why = struct_touch_invalidated(df_m5_c, bos_stype, p.get('choch_level'), p.get('peak_val'))
+                if invalid:
+                    cancel_order(coin, p['order_id'])
+                    print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — {why}")
+                    log_entry(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — {why}")
+                    del idm_pending[key]
+                    continue
             continue
 
         # ── IDM M5 ENGULF MODE ──
         if IDM_M5_ENGULF and p.get('order_id') is None and not p.get('m5_hangus'):
-            # Cek puncak BOS besar ditembus → hangus permanen
-            if p.get('peak_val'):
-                df_h1_pk = get_data(coin, "60", limit=5)
-                if df_h1_pk is not None:
-                    pk = float(p['peak_val'])
-                    curr_cl = float(df_h1_pk['close'].iloc[-1])
-                    bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
-                    if (bos_stype == "Long" and curr_cl > pk) or (bos_stype == "Short" and curr_cl < pk):
-                        print(f"🚫 {coin}: IDM {p['e_stype']} hangus — puncak {pk:.6g} ditembus")
-                        _bos_h = bos_stype
-                        inducement_done[(coin, _bos_h)] = (p.get('swing_val'), p.get('choch_level'), p['e_stype'])
-                        del idm_pending[key]
-                        continue
+            # Cek CHOCH atau puncak BOS besar tersentuh M5 (wick) → hangus permanen
+            if p.get('peak_val') or p.get('choch_level'):
+                df_m5_pk = get_data(coin, "5", limit=100)
+                if df_m5_pk is not None and 'ts' in df_m5_pk.columns:
+                    df_m5_pk = df_m5_pk[df_m5_pk['ts'] >= p.get('placed_ts', 0) * 1000]
+                bos_stype = "Short" if p['e_stype'] == "Long" else "Long"
+                invalid, why = struct_touch_invalidated(df_m5_pk, bos_stype, p.get('choch_level'), p.get('peak_val'))
+                if invalid:
+                    print(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
+                    log_entry(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
+                    _bos_h = bos_stype
+                    inducement_done[(coin, _bos_h)] = (p.get('swing_val'), p.get('choch_level'), p['e_stype'])
+                    del idm_pending[key]
+                    continue
             df_m5_idm = get_data(coin, "5", limit=100)
             if df_m5_idm is None:
                 continue
