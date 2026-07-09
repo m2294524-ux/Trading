@@ -120,32 +120,45 @@ class _LogHandler(BaseHTTPRequestHandler):
                     coin_last_ts[b['coin']] = b['ts']
             # Urut: aktivitas TERBARU paling atas ("kalau ada aktivitas terbaru, jadi paling atas")
             coins_sorted = sorted(coin_last_ts.keys(), key=lambda c: coin_last_ts[c], reverse=True)
-            html = ("<!doctype html><html><head><meta charset='utf-8'><title>Bot Log</title>"
+            html = ("<!doctype html><html><head><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1'>"
+                    "<title>Bot Log</title>"
                     "<style>"
-                    "body{font-family:'Courier New',monospace;background:#0d0d0d;color:#ddd;margin:0;padding:0}"
-                    ".topbar{display:flex;gap:8px;padding:10px 14px;background:#181818;border-bottom:1px solid #333;"
-                    "position:sticky;top:0;z-index:2}"
-                    ".tabbtn{background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:7px 16px;"
-                    "cursor:pointer;font-size:14px}"
+                    "*{box-sizing:border-box}"
+                    "html,body{width:100%;overflow-x:hidden}"
+                    "body{font-family:'Courier New',monospace;background:#0d0d0d;color:#ddd;margin:0;padding:0;"
+                    "font-size:13px}"
+                    ".topbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px 10px;"
+                    "background:#181818;border-bottom:1px solid #333;position:sticky;top:0;z-index:2}"
+                    ".tabbtn{background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:8px 14px;"
+                    "cursor:pointer;font-size:13px;flex:0 0 auto}"
                     ".tabbtn.active{background:#2a6;color:#fff;border-color:#2a6}"
-                    "a.mini{color:#7ad;text-decoration:none;margin-left:auto;align-self:center;font-size:13px}"
-                    ".wrap{display:flex;height:calc(100vh - 46px)}"
-                    ".sidebar{width:200px;overflow-y:auto;border-right:1px solid #333;background:#151515;display:none}"
+                    ".minilinks{display:flex;gap:10px;margin-left:auto;flex-wrap:wrap}"
+                    "a.mini{color:#7ad;text-decoration:none;font-size:12px;white-space:nowrap}"
+                    ".wrap{display:flex;flex-direction:column;min-height:calc(100vh - 48px)}"
+                    "@media(min-width:700px){.wrap{flex-direction:row;height:calc(100vh - 48px)}}"
+                    ".sidebar{display:none;border-bottom:1px solid #333;background:#151515;"
+                    "max-height:38vh;overflow-y:auto}"
+                    "@media(min-width:700px){.sidebar{max-height:none;height:100%;width:180px;"
+                    "border-bottom:none;border-right:1px solid #333;flex:0 0 180px}}"
                     ".sidebar.show{display:block}"
                     ".coinbtn{display:block;width:100%;text-align:left;background:none;border:none;color:#ccc;"
-                    "padding:9px 14px;cursor:pointer;font-size:13px;border-bottom:1px solid #222}"
-                    ".coinbtn:hover{background:#222}"
+                    "padding:10px 14px;cursor:pointer;font-size:13px;border-bottom:1px solid #222}"
+                    ".coinbtn:active,.coinbtn:hover{background:#222}"
                     ".coinbtn.active{background:#26a;color:#fff}"
-                    ".main{flex:1;overflow-y:auto;padding:10px 16px;white-space:pre-wrap;font-size:13px;line-height:1.5}"
-                    ".blk{padding:4px 0;border-bottom:1px solid #1c1c1c}"
+                    ".main{flex:1;overflow-y:auto;overflow-x:hidden;padding:8px 10px;white-space:pre-wrap;"
+                    "word-break:break-word;font-size:12px;line-height:1.5;-webkit-overflow-scrolling:touch}"
+                    ".blk{padding:5px 0;border-bottom:1px solid #1c1c1c}"
+                    "@media(min-width:700px){.main{font-size:13px;padding:10px 16px}}"
                     "</style></head><body>"
                     "<div class='topbar'>"
                     "<button id='tab-semua' class='tabbtn active' onclick=\"setTab('semua')\">Semua</button>"
                     "<button id='tab-percoin' class='tabbtn' onclick=\"setTab('percoin')\">Per Koin</button>"
-                    "<a class='mini' href='/entries'>raw text</a>"
+                    "<div class='minilinks'>"
+                    "<a class='mini' href='/entries'>raw</a>"
                     "<a class='mini' href='/logs'>console</a>"
                     "<a class='mini' href='/ohlc'>ohlc</a>"
-                    "</div>"
+                    "</div></div>"
                     "<div class='wrap'>"
                     "<div id='sidebar' class='sidebar'></div>"
                     "<div id='main' class='main'></div>"
@@ -166,7 +179,7 @@ class _LogHandler(BaseHTTPRequestHandler):
                     "    sidebar.className='sidebar show';"
                     "    sidebar.innerHTML=COINS.map(c=>'<button class=\"coinbtn'+(c===selCoin?' active':'')+'\" "
                     "onclick=\"selectCoin(\\''+c+'\\')\">'+c+'</button>').join('');"
-                    "    if(!selCoin){main.innerHTML='<i>Pilih koin di sebelah kiri.</i>';}"
+                    "    if(!selCoin){main.innerHTML='<i>Pilih koin di atas/kiri.</i>';}"
                     "    else{"
                     "      const filtered=BLOCKS.filter(b=>b.coin===selCoin);"
                     "      main.innerHTML=filtered.length?filtered.map(b=>'<div class=\"blk\">'+esc(b.text)+'</div>').join('')"
@@ -262,8 +275,8 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 4.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_ACT_R      = 2.5    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -615,7 +628,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.00    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.03    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2233,7 +2246,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     Validasi kualitas sinyal sepenuhnya diserahkan ke filter EMA20 di bawah.
 
     FILTER EMA20 (FVG maupun IDM), TIGA syarat, semuanya harus lolos:
-      1. Salah satu dari 3 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
+      1. Salah satu dari 5 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
          itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma "high>=ema"/
          "low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung tersentuh).
       2. Candle ENGULFING itu sendiri harus close di sisi EMA20 yang benar: Long → close di ATAS
@@ -2287,7 +2300,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
             return None   # belum tersentuh
 
     def _ema_touched(i):
-        """3 candle SEBELUM candle engulfing (i-3..i-1): minimal 1 harus BENAR-BENAR menyentuh
+        """5 candle SEBELUM candle engulfing (i-5..i-1): minimal 1 harus BENAR-BENAR menyentuh
         EMA20 — nilai EMA20 candle itu harus masuk ke dalam range candle (low<=ema<=high).
         Ini BUKAN sekadar 'high>=ema' atau 'low<=ema' saja, karena kalau harga sudah lama berada
         jauh di satu sisi EMA (mis. rally panjang di atas EMA yang lamban), high>=ema akan SELALU
@@ -2295,7 +2308,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
         yang memuat nilai EMA supaya valid untuk kedua arah (Long maupun Short)."""
         if 'ema20' not in df_m5.columns:
             return True
-        for j in range(max(0, i - 3), i):
+        for j in range(max(0, i - 5), i):
             ema_j = float(df_m5['ema20'].iloc[j])
             lo_j  = float(df_m5['low'].iloc[j])
             hi_j  = float(df_m5['high'].iloc[j])
@@ -2338,7 +2351,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 rejected = False
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20)")
+                              f"DITOLAK (5 candle sebelum tak sentuh EMA20)")
                     rejected = True
                 elif not (cl > ema_i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
@@ -2374,7 +2387,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 rejected = False
                 if not _ema_touched(i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (3 candle sebelum tak sentuh EMA20)")
+                              f"DITOLAK (5 candle sebelum tak sentuh EMA20)")
                     rejected = True
                 elif not (cl < ema_i):
                     log_entry(f"   {coin} {stype}: engulfing @ {_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
@@ -2461,12 +2474,8 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
     # CHOCH/puncak invalidation (WICK M5, real-time): beda dari cek historis di atas yang pakai
     # CLOSE H1 — ini langsung batal begitu wick candle M5 menyentuh choch ATAU melewati puncak
     # (tren masih lanjut, puncak belum final). Tidak perlu tunggu candle H1 close.
-    # GATE: hanya berlaku SETELAH trigger1 (ujung gap) sudah tersentuh — kalau belum pernah
-    # tersentuh sama sekali, jangan batalkan cuma gara2 puncak/choch bergerak (itu wajar,
-    # struktur BOS besar memang masih terus terbentuk sebelum kita mulai memantau). Kalau memang
-    # ada BOS baru (swing_val beda), itu ditangani terpisah lewat re-deteksi di run_bot loop.
     bos_stype_fvg = stype   # untuk FVG, `stype` = arah BOS besar itu sendiri
-    if setup.get('m5_c1c_touched') and df_m5 is not None and 'ts' in df_m5.columns:
+    if df_m5 is not None and 'ts' in df_m5.columns:
         _df_m5_chk = df_m5[df_m5['ts'] >= setup.get('created_ts', 0) * 1000]
         invalid, why = struct_touch_invalidated(_df_m5_chk, bos_stype_fvg, choch_level, setup.get('peak_val'))
         if invalid:
@@ -2711,9 +2720,7 @@ def check_idm_pending():
 
         # ── IDM WAIT_FILL: limit sudah terpasang — cancel jika CHOCH atau PUNCAK tersentuh M5 (wick) ──
         if IDM_M5_ENGULF and p.get('phase') == 'WAIT_FILL' and p.get('order_id'):
-            # Gate: trigger H1 sudah pasti tersentuh (syarat pembuatan idm_pending), jadi ini selalu True
-            # utk IDM — tetap dicek eksplisit biar konsisten dgn FVG.
-            if p.get('m5_triggered') and (p.get('peak_val') or p.get('choch_level')):
+            if p.get('peak_val') or p.get('choch_level'):
                 df_m5_c = get_data(coin, "5", limit=100)
                 if df_m5_c is not None and 'ts' in df_m5_c.columns:
                     df_m5_c = df_m5_c[df_m5_c['ts'] >= p.get('placed_ts', 0) * 1000]
@@ -2723,8 +2730,6 @@ def check_idm_pending():
                     cancel_order(coin, p['order_id'])
                     print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — {why}")
                     log_entry(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — {why}")
-                    inducement_done[(coin, bos_stype)] = (bos_stype, round(float(p.get('choch_level', 0)), 10),
-                                                           round(float(p.get('swing_val', 0)), 10))
                     del idm_pending[key]
                     continue
             continue
@@ -2732,9 +2737,7 @@ def check_idm_pending():
         # ── IDM M5 ENGULF MODE ──
         if IDM_M5_ENGULF and p.get('order_id') is None and not p.get('m5_hangus'):
             # Cek CHOCH atau puncak BOS besar tersentuh M5 (wick) → hangus permanen
-            # Gate: trigger H1 sudah pasti tersentuh (syarat pembuatan idm_pending) — tetap dicek
-            # eksplisit biar konsisten dgn FVG.
-            if p.get('m5_triggered') and (p.get('peak_val') or p.get('choch_level')):
+            if p.get('peak_val') or p.get('choch_level'):
                 df_m5_pk = get_data(coin, "5", limit=100)
                 if df_m5_pk is not None and 'ts' in df_m5_pk.columns:
                     df_m5_pk = df_m5_pk[df_m5_pk['ts'] >= p.get('placed_ts', 0) * 1000]
@@ -2743,13 +2746,8 @@ def check_idm_pending():
                 if invalid:
                     print(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
                     log_entry(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
-                    # PENTING: format sig HARUS SAMA PERSIS dengan yang dicek di check_inducement_entry
-                    # (stype, round(choch,10), round(swing_val,10)) — sebelumnya urutan/isi beda
-                    # (pakai e_stype & tidak dibulatkan) sehingga guard anti-recreate tidak pernah match,
-                    # dan struktur yang baru saja hangus langsung ke-create ULANG di tick berikutnya
-                    # dengan placed_ts baru (riwayat sentuhan sebelumnya jadi "terlupakan").
-                    inducement_done[(coin, bos_stype)] = (bos_stype, round(float(p.get('choch_level', 0)), 10),
-                                                           round(float(p.get('swing_val', 0)), 10))
+                    _bos_h = bos_stype
+                    inducement_done[(coin, _bos_h)] = (p.get('swing_val'), p.get('choch_level'), p['e_stype'])
                     del idm_pending[key]
                     continue
             df_m5_idm = get_data(coin, "5", limit=100)
