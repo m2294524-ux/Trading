@@ -299,7 +299,7 @@ SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False =
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
 INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 35% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.99 # ...sampai 60% range. (pita IDM 35-60%)
+INDUCEMENT_ZONE_HI = 0.786 # ...sampai 60% range. (pita IDM 35-60%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -616,7 +616,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.618   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
@@ -628,7 +628,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.03    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.02    # SL = ujung candle fokus ± N% range BOS
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2198,7 +2198,7 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
                f"dist:{dist/entry_adj*100:.3f}% (SL {_slr:.1f}% range) Gap:{gap_s/entry_adj*100:.3f}%")
     setup = {
         'type': stype, 'phase': 'WAIT_APPROACH', 'entry': entry_adj, 'sl': sl_entry,
-        'dist': dist, 'orig_ocl': c1_c,   # C1 close = trigger sentuhan M5
+        'dist': dist, 'orig_ocl': trig1,   # trigger1 = ujung gap (SAMA dgn entry_adj), bukan C1 close lagi
         'fvg_list': gaps, 'bos_ts': bos_ts, 'bos_rng': bos_rng,
         'created_ts': time.time(),
         'bos_idx': bos_idx, 'swing_val': swing_val, 'choch_level': choch_level,
@@ -2262,7 +2262,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
     if df_m5 is None or len(df_m5) < 2:
         return None
     stype   = setup['type']
-    c1c     = float(setup.get('orig_ocl', 0))   # C1 close H1 = threshold sentuhan
+    c1c     = float(setup.get('orig_ocl', 0))   # trigger H1 (ujung gap utk FVG / trigger IDM)
     if c1c <= 0:
         return None
 
@@ -2273,7 +2273,14 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
 
     # ── Filter: hanya proses candle M5 yang terbentuk SETELAH setup dibuat ──
     # Mencegah bot mereplay engulfing historis saat redeploy.
-    created_ts_ms = setup.get('created_ts', 0) * 1000   # detik → ms
+    # PENTING: created_ts adalah waktu wall-clock (time.time()), yg biasanya jatuh DI TENGAH
+    # candle M5 yang sedang berjalan saat itu (bukan pas candle baru mulai). Candle yg sedang
+    # berjalan itu 'ts'-nya (waktu OPEN) otomatis lebih awal dari created_ts -> kalau filter
+    # persis "ts >= created_ts", candle itu ke-exclude padahal high/low finalnya baru terbentuk
+    # SETELAH setup dibuat (wick besarnya bisa saja terjadi setelah creation, sebelum candle
+    # close). Makanya dikurangi 1 interval candle (5 menit) supaya candle yg sedang berjalan
+    # persis saat creation tetap ikut kescan.
+    created_ts_ms = setup.get('created_ts', 0) * 1000 - 300000   # detik → ms, mundur 1 candle M5
     if created_ts_ms > 0 and 'ts' in df_m5.columns:
         df_m5 = df_m5[df_m5['ts'] >= created_ts_ms].reset_index(drop=True)
         if len(df_m5) < 2:
