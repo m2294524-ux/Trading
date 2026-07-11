@@ -5,6 +5,7 @@ import os
 import time
 import sys
 import threading
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================================
@@ -299,7 +300,7 @@ SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False =
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
 INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.99 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
+INDUCEMENT_ZONE_HI = 0.50 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -428,6 +429,55 @@ pending          = {}
 idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib retrace candle M5)
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
+
+# ── Persistensi inducement_done ke file JSON (bertahan lewat redeploy/restart) ──
+# Path bisa dioverride via env var STATE_FILE_PATH (arahkan ke Railway Volume kalau ada,
+# misal "/data/bot_state.json" — kalau tidak diset & filesystem-nya ephemeral, state akan
+# tetap hilang saat redeploy, sama seperti sebelumnya).
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "bot_state.json")
+
+def _sig_to_list(sig):
+    """Tuple signature (bisa berisi None) -> list, supaya JSON-serializable."""
+    if sig is None:
+        return None
+    return list(sig)
+
+def _sig_from_list(lst):
+    """List dari JSON -> tuple signature (balik ke bentuk asli)."""
+    if lst is None:
+        return None
+    return tuple(lst)
+
+def save_state():
+    """Tulis ulang inducement_done ke STATE_FILE (dipanggil tiap kali inducement_done di-update)."""
+    try:
+        encoded = {f"{coin}|{stype}": _sig_to_list(sig) for (coin, stype), sig in inducement_done.items()}
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({"inducement_done": encoded}, f)
+        os.replace(tmp_path, STATE_FILE)   # atomic write, hindari file korup kalau kepotong
+    except Exception as e:
+        print(f"⚠️ save_state gagal: {e}")
+
+def load_state():
+    """Load inducement_done dari STATE_FILE saat bot start. Aman kalau file belum ada."""
+    global inducement_done
+    if not os.path.exists(STATE_FILE):
+        print(f"ℹ️ {STATE_FILE} belum ada — mulai inducement_done kosong (normal di run pertama).")
+        return
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        encoded = data.get("inducement_done", {})
+        loaded = {}
+        for key, sig_list in encoded.items():
+            coin, stype = key.split("|", 1)
+            loaded[(coin, stype)] = _sig_from_list(sig_list)
+        inducement_done = loaded
+        print(f"✅ State dimuat dari {STATE_FILE}: {len(inducement_done)} entri inducement_done.")
+    except Exception as e:
+        print(f"⚠️ load_state gagal ({e}) — mulai inducement_done kosong.")
+
 instrument_cache = {}
 funding_cache    = {}   # symbol -> {'rate': float, 'ts': float} — cache funding rate (TTL=FUNDING_CACHE_TTL)
 done_setups      = {}   # coin -> {swing_val, stype, used_ocl} — cegah re-entry di BOS yang sama
@@ -628,7 +678,7 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # yang keluar dari range candle fokus. Entry terjadi saat close candle M5 melewati high candle fokus
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
-SL_ENGULF_PCT     = 0.02    # SL = ujung candle fokus ± N% range BOS
+SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke besar-kecil BOS)
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -743,7 +793,21 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
     def _opp(d):
         return 'Short' if d == 'Long' else 'Long'
 
-    decision_idx = 0
+    def _wick_touches_ema(idx):
+        lo = float(seg['low'].iloc[idx]); hi = float(seg['high'].iloc[idx]); ema_i = float(seg['ema20'].iloc[idx])
+        return lo <= ema_i <= hi
+
+    # Cari candle PERTAMA (mulai dari awal segmen) yang wick-nya menyentuh EMA20 —
+    # ini jadi syarat wajib SEBELUM body-nya boleh dicek, berlaku sama untuk candle
+    # pertama maupun candle retest berikutnya (tidak ada lagi perlakuan berbeda).
+    decision_idx = None
+    for i in range(0, closed_end):
+        if _wick_touches_ema(i):
+            decision_idx = i
+            break
+    if decision_idx is None:
+        return False, None, "belum ada candle H1 (wick) yang menyentuh EMA20 sejak trigger tersentuh"
+
     while decision_idx < closed_end:
         op  = float(seg['open'].iloc[decision_idx]); cl = float(seg['close'].iloc[decision_idx])
         ema = float(seg['ema20'].iloc[decision_idx])
@@ -753,13 +817,12 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
             same_side = (above and direction == 'Long') or (not above and direction == 'Short')
             final_dir = direction if same_side else _opp(direction)
             mode = "IDM/FVG (searah)" if same_side else "EMA (dibalik)"
-            return True, final_dir, (f"H1 {_ts_wib(seg['ts'].iloc[decision_idx])}: body "
+            return True, final_dir, (f"H1 {_ts_wib(seg['ts'].iloc[decision_idx])}: wick sentuh EMA20 & body "
                                       f"{'di atas' if above else 'di bawah'} EMA20({ema:.6g}) -> mode {mode}")
         # EMA di tengah body (ambigu) -> cari candle SETELAHNYA yang wick-nya menyentuh EMA lagi
         found = None
         for j in range(decision_idx + 1, closed_end):
-            lo = float(seg['low'].iloc[j]); hi = float(seg['high'].iloc[j]); ema_j = float(seg['ema20'].iloc[j])
-            if lo <= ema_j <= hi:
+            if _wick_touches_ema(j):
                 found = j
                 break
         if found is None:
@@ -1496,6 +1559,7 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'h1_ema_resolved': False, 'h1_ema_dir': None, 'h1_ema_trigger_ts': float(trig['ts']),
                 }
                 inducement_done[(coin, stype)] = sig
+                save_state()
                 rec = (
                     f"════ IDM M5 ENGULF MONITOR ════\n"
                     f"  {coin} | menunggu engulfing {e_stype} M5 | trigger={prot:.6g}\n"
@@ -1540,6 +1604,7 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'peak_val': a['peak_val'], 'bos_type': e_stype,
                 }
                 inducement_done[(coin, stype)] = sig
+                save_state()
                 rec = (
                     f"════ LIMIT INDUCEMENT ({IDM_LIMIT_FIB*100:.0f}% range candle H1 IDM) ════\n"
                     f"  {coin} | LIMIT {e_stype} @ {entry_p:.6g} | SL {sl_p:.6g}\n"
@@ -1580,6 +1645,7 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                 'swing2': a['peak_val'], 'kind': 'inducement',
             }
             inducement_done[(coin, stype)] = sig   # tandai struktur ini sudah di-entry (anti entry-ulang)
+            save_state()
             rec = (
                 f"════ ENTRY INDUCEMENT ════\n"
                 f"  {coin} | entry {e_stype} MARKET @ ~{curr:.6g} qty {qty}\n"
@@ -2427,10 +2493,12 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
             long_sweep_opp  = (lo <= f_lo)
             short_sweep_opp = (hi >= f_hi)
 
-            # Entry & SL dari candle SEBELUM engulfing (prev candle) — SAMA-SAMA dari candle ini
-            # supaya jarak entry-SL proporsional & konsisten (bukan dari candle engulfing yang
-            # ukurannya bisa jauh beda). Long: entry = high prev candle, SL = low prev candle - buffer.
-            # Short: entry = low prev candle, SL = high prev candle + buffer.
+            # Entry = high/low candle SEBELUM engulfing (prev candle) — TIDAK BERUBAH.
+            # SL = FIXED proporsional dari entry ± SL_ENGULF_PCT% range BOS besar (bukan lagi dari
+            # low/high candle sebelum engulfing) — supaya jarak entry-SL selalu proporsional ke
+            # ukuran BOS, tidak random besar/kecil tergantung bentuk candle di titik itu.
+            # Long: entry = high prev candle, SL = entry - buffer.
+            # Short: entry = low prev candle, SL = entry + buffer.
             prev_c_hi = float(df_m5['high'].iloc[i-1])
             prev_c_lo = float(df_m5['low'].iloc[i-1])
 
@@ -2458,17 +2526,17 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
                     range_base = False
                     continue
                 entry_p  = prev_c_hi
-                sl_raw   = prev_c_lo
                 sl_buf   = SL_ENGULF_PCT * bos_rng
-                sl_price = sl_raw - sl_buf
+                sl_raw   = entry_p - sl_buf
+                sl_price = sl_raw
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} > focus_hi={f_hi:.6g} "
                       f"→ entry={entry_p:.6g} (high candle sebelum engulfing) SL={sl_price:.6g} "
-                      f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"(fixed entry-{SL_ENGULF_PCT*100:.0f}% range BOS)")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Buy',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo,
                         'engulf_ohlc': {'open': op, 'high': hi, 'low': lo, 'close': cl},
-                        'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
+                        'prev_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
                         'sl_raw': sl_raw, 'sl_buffer': sl_buf}
             if stype == 'Short' and cl < f_lo and not short_sweep_opp and not range_base:
                 ema_i    = float(df_m5['ema20'].iloc[i])
@@ -2494,17 +2562,17 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
                     range_base = False
                     continue
                 entry_p  = prev_c_lo
-                sl_raw   = prev_c_hi
                 sl_buf   = SL_ENGULF_PCT * bos_rng
-                sl_price = sl_raw + sl_buf
+                sl_raw   = entry_p + sl_buf
+                sl_price = sl_raw
                 print(f"   {coin} {stype}: ENGULFING M5 idx={i} close={cl:.6g} < focus_lo={f_lo:.6g} "
                       f"→ entry={entry_p:.6g} (low candle sebelum engulfing) SL={sl_price:.6g} "
-                      f"[prev hi={prev_c_hi:.6g} lo={prev_c_lo:.6g}]")
+                      f"(fixed entry+{SL_ENGULF_PCT*100:.0f}% range BOS)")
                 setup['m5_focus_idx'] = i
                 return {'entry': entry_p, 'sl': sl_price, 'side': 'Sell',
                         'engulf_idx': i, 'focus_hi': f_hi, 'focus_lo': f_lo,
                         'engulf_ohlc': {'open': op, 'high': hi, 'low': lo, 'close': cl},
-                        'sl_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
+                        'prev_candle_ohlc': {'high': prev_c_hi, 'low': prev_c_lo},
                         'sl_raw': sl_raw, 'sl_buffer': sl_buf}
 
             # ── Update fokus ──
@@ -2640,7 +2708,7 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
             if engulf:
                 # Pasang LIMIT ORDER di ujung candle fokus (bukan market order)
                 limit_entry = engulf['entry']   # high fokus (Long) / low fokus (Short)
-                limit_sl    = engulf['sl']       # low fokus - buffer / high fokus + buffer
+                limit_sl    = engulf['sl']       # entry fixed ± SL_ENGULF_PCT% range BOS besar
                 side_order  = engulf['side']     # 'Buy'/'Sell' — SUDAH pakai arah hasil gate EMA20 H1
                 final_dir   = setup.get('h1_ema_dir', stype)
                 oid = place_limit_order(coin, side_order, limit_entry, limit_sl)
@@ -2655,14 +2723,12 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                           f"SL:{limit_sl:.6f} | break:{setup.get('swing_val'):.6g} "
                           f"puncak:{setup.get('peak_val'):.6g}{_mode_lbl}")
                     _eo = engulf.get('engulf_ohlc', {})
-                    _so = engulf.get('sl_candle_ohlc', {})
                     log_entry(
                         f"════ FVG ENGULF LIMIT {final_dir} {coin} @ {limit_entry:.6g}{_mode_lbl} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
                         f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
-                        f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
-                        f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
+                        f"  SL: entry={limit_entry:.6g} fixed ± buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
                         f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
                     )
                     return 'lock'
@@ -2850,7 +2916,12 @@ def check_idm_pending():
                     print(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
                     log_entry(f"🚫 {coin}: IDM {p['e_stype']} hangus — {why}")
                     _bos_h = bos_stype
-                    inducement_done[(coin, _bos_h)] = (p.get('swing_val'), p.get('choch_level'), p['e_stype'])
+                    inducement_done[(coin, _bos_h)] = (
+                        _bos_h,
+                        round(p.get('choch_level'), 10) if p.get('choch_level') is not None else None,
+                        round(p.get('swing_val'), 10) if p.get('swing_val') is not None else None,
+                    )
+                    save_state()
                     del idm_pending[key]
                     continue
             df_m5_idm = get_data(coin, "5", limit=100)
@@ -2913,14 +2984,12 @@ def check_idm_pending():
                     print(f"\U0001f4cd {coin}: IDM M5 ENGULF {final_dir} → LIMIT @ {limit_entry:.6g} "
                           f"SL:{limit_sl:.6g}{_mode_lbl}")
                     _eo = engulf.get('engulf_ohlc', {})
-                    _so = engulf.get('sl_candle_ohlc', {})
                     log_entry(
                         f"════ IDM M5 ENGULF LIMIT {final_dir} {coin} @ {limit_entry:.6g}{_mode_lbl} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
                         f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
-                        f"  SL: candle SEBELUM engulfing high={_so.get('high',0):.6g} low={_so.get('low',0):.6g} "
-                        f"→ raw={engulf.get('sl_raw',0):.6g} + buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
+                        f"  SL: entry={limit_entry:.6g} fixed ± buffer({SL_ENGULF_PCT*100:.0f}% range BOS)="
                         f"{engulf.get('sl_buffer',0):.6g} → SL final={limit_sl:.6g}"
                     )
             continue   # M5 engulf path selesai, lanjut ke key berikutnya
@@ -2945,6 +3014,7 @@ def check_idm_pending():
 def run_bot():
     global bot_start_ts
     bot_start_ts = time.time()   # timestamp saat bot mulai jalan
+    load_state()   # muat inducement_done dari file (bertahan lewat redeploy/restart)
     print("SMC INTI BOT — BOS H1 -> FVG -> Limit @ C1.close -> TP 1:2")
     print(f"CONFIG v9.22 | swing {SWING_BARS}-{SWING_BARS}/sub {SUBLEG_BARS}-{SUBLEG_BARS} | FVG biasa (warna bebas) | "
           f"zona C1 {ENTRY_ZONE_LO*100:.1f}%-{ENTRY_ZONE_HI*100:.0f}%{'(dinamis)' if ZONE_FROM_RETRACE else ''} | "
