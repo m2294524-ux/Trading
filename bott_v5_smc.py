@@ -298,8 +298,8 @@ SL_CAP_RANGE     = 0.01   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANG
 SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False = SL ikut C1, di-cap 10% range
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
-INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 35% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.786 # ...sampai 60% range. (pita IDM 35-60%)
+INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
+INDUCEMENT_ZONE_HI = 0.99 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -616,7 +616,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.618   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
@@ -712,6 +712,60 @@ def rebreak_invalid(df, start_idx, swing2, choch_level, stype, lock_retr=0.50):
             if retraced and cl[k] < swing2:
                 return True
         return False
+
+
+def h1_ema_gate(df_h1, trigger_ts_ms, direction):
+    """Dipanggil SEKALI saat trigger H1 (IDM atau FVG) baru tersentuh — bukan tiap saat.
+    Cek posisi body candle H1 (open-close, bukan wick) terhadap EMA20 H1 utk menentukan arah
+    entry final:
+      - Body SELURUHNYA di sisi 'default' arah (Long->di atas EMA, Short->di bawah EMA)
+        -> arah TETAP sama (mode IDM/FVG biasa).
+      - Body SELURUHNYA di sisi BERLAWANAN -> arah DIBALIK (mode EMA, mis. IDM Short jadi
+        cari entry Long karena banyak buyer mengisi di EMA).
+      - EMA ada DI TENGAH body (ambigu, tak bisa ditentukan) -> tunggu candle H1 BERIKUTNYA yang
+        wick-nya menyentuh EMA lagi, lalu candle itu yang jadi acuan keputusan (ulang aturan yang
+        sama: body di atas/bawah EMA candle retest itu).
+    trigger_ts_ms = waktu (ms) saat trigger H1 pertama tersentuh (dipakai cari candle H1 pertama
+    yang relevan, mundur 1 jam supaya candle yang sedang berjalan saat trigger tersentuh ikut).
+    direction = arah entry DEFAULT ('Long'/'Short') sebelum dipengaruhi EMA.
+    Return: (resolved: bool, final_direction: str|None, info: str)."""
+    if df_h1 is None or len(df_h1) == 0 or 'ts' not in df_h1.columns:
+        return False, None, "data H1 kosong"
+    df = df_h1.copy()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    cutoff = trigger_ts_ms - 3600_000   # mundur 1 candle H1 (sama alasannya dgn fix created_ts M5)
+    seg = df[df['ts'] >= cutoff].reset_index(drop=True)
+    n = len(seg)
+    closed_end = n - 1   # jangan hitung candle H1 yang masih berjalan
+    if closed_end < 1:
+        return False, None, "belum ada candle H1 closed sejak trigger tersentuh"
+
+    def _opp(d):
+        return 'Short' if d == 'Long' else 'Long'
+
+    decision_idx = 0
+    while decision_idx < closed_end:
+        op  = float(seg['open'].iloc[decision_idx]); cl = float(seg['close'].iloc[decision_idx])
+        ema = float(seg['ema20'].iloc[decision_idx])
+        body_lo, body_hi = min(op, cl), max(op, cl)
+        if ema < body_lo or ema > body_hi:
+            above = ema < body_lo
+            same_side = (above and direction == 'Long') or (not above and direction == 'Short')
+            final_dir = direction if same_side else _opp(direction)
+            mode = "IDM/FVG (searah)" if same_side else "EMA (dibalik)"
+            return True, final_dir, (f"H1 {_ts_wib(seg['ts'].iloc[decision_idx])}: body "
+                                      f"{'di atas' if above else 'di bawah'} EMA20({ema:.6g}) -> mode {mode}")
+        # EMA di tengah body (ambigu) -> cari candle SETELAHNYA yang wick-nya menyentuh EMA lagi
+        found = None
+        for j in range(decision_idx + 1, closed_end):
+            lo = float(seg['low'].iloc[j]); hi = float(seg['high'].iloc[j]); ema_j = float(seg['ema20'].iloc[j])
+            if lo <= ema_j <= hi:
+                found = j
+                break
+        if found is None:
+            return False, None, "EMA di tengah body candle H1, menunggu candle H1 sentuh EMA lagi"
+        decision_idx = found   # candle retest ini jadi acuan keputusan baru, ulangi cek dari sini
+    return False, None, "menunggu candle H1 close berikutnya"
 
 
 def struct_touch_invalidated(df_m5, bos_stype, choch_level, peak_val):
@@ -1436,6 +1490,10 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'm5_focus_hi': float(trig['high']), 'm5_focus_lo': float(trig['low']),
                     'm5_focus_idx': -1,
                     'm5_hangus': False,
+                    # Gate EMA20 H1 (dicek sekali saat trigger tersentuh, lihat h1_ema_gate()).
+                    # trigger_ts langsung dari waktu candle `trig` (candle M5 yg terbukti menyapu
+                    # trigger H1) — sudah pasti tahu persis kapan trigger tersentuh, tak perlu tunggu.
+                    'h1_ema_resolved': False, 'h1_ema_dir': None, 'h1_ema_trigger_ts': float(trig['ts']),
                 }
                 inducement_done[(coin, stype)] = sig
                 rec = (
@@ -2203,9 +2261,11 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
         'created_ts': time.time(),
         'bos_idx': bos_idx, 'swing_val': swing_val, 'choch_level': choch_level,
         'peak_val': _B, 'swing2': peak_val, 'brk_idx': brk_idx,
-        # M5 engulfing monitor state (1x engulfing, filter EMA20 3-candle-sebelum di check_m5_engulfing)
+        # M5 engulfing monitor state (1x engulfing, filter EMA20 M5 5-candle-sebelum di check_m5_engulfing)
         'm5_c1c_touched': False,
         'm5_focus_hi': 0.0, 'm5_focus_lo': 0.0, 'm5_focus_idx': 0,
+        # Gate EMA20 H1 (dicek sekali saat trigger tersentuh, lihat h1_ema_gate())
+        'h1_ema_resolved': False, 'h1_ema_dir': None, 'h1_ema_trigger_ts': None,
     }
     return setup, logline
 
@@ -2230,7 +2290,7 @@ def _ts_wib(ts_ms):
         return str(ts_ms)
 
 
-def check_m5_engulfing(coin, setup, df_m5, bos_rng):
+def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
     """Monitor M5 setelah trigger H1 tersentuh (C1 close untuk FVG lama / ujung gap utk FVG /
     trigger IDM). Cari konfirmasi engulfing untuk market order.
     Return: dict {'entry': float, 'sl': float, 'side': str} jika engulfing terkonfirmasi,
@@ -2243,9 +2303,13 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
 
     IDM dan FVG sekarang SAMA PERSIS: begitu trigger H1 tersentuh, candle M5 pertama yang
     menyentuhnya LANGSUNG jadi fokus pertama — tidak ada lagi trigger2/tunggu candle kedua.
-    Validasi kualitas sinyal sepenuhnya diserahkan ke filter EMA20 di bawah.
 
-    FILTER EMA20 (FVG maupun IDM), TIGA syarat, semuanya harus lolos:
+    GATE EMA20 H1 (dicek SEKALI saja, tepat saat trigger H1 baru tersentuh — bukan tiap saat):
+    lihat h1_ema_gate(). Menentukan arah entry FINAL — bisa tetap searah IDM/FVG asli, atau
+    dibalik ("mode EMA") kalau body candle H1 berakhir di sisi berlawanan dari EMA20 H1. Baru
+    setelah gate ini selesai, monitoring M5 (di bawah) mulai jalan, memakai arah HASIL gate.
+
+    FILTER EMA20 M5 (FVG maupun IDM), TIGA syarat, semuanya harus lolos:
       1. Salah satu dari 5 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
          itu harus benar-benar masuk range candle: low<=EMA20<=high — bukan cuma "high>=ema"/
          "low<=ema" saja, supaya harga yang sudah lama di satu sisi EMA tidak dihitung tersentuh).
@@ -2300,11 +2364,29 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng):
                 setup['m5_focus_hi']    = hi
                 setup['m5_focus_lo']    = lo
                 setup['m5_focus_idx']   = i
+                if setup.get('h1_ema_trigger_ts') is None and 'ts' in df_m5.columns:
+                    setup['h1_ema_trigger_ts'] = float(df_m5['ts'].iloc[i])
                 print(f"   {coin} {stype}: trigger H1 ({c1c:.6g}) tersentuh M5 idx={i} "
-                      f"hi={hi:.6g} lo={lo:.6g} — mulai monitor engulfing")
+                      f"hi={hi:.6g} lo={lo:.6g} — cek gate EMA20 H1 dulu")
                 break
         if not setup.get('m5_c1c_touched'):
             return None   # belum tersentuh
+
+    # ── GATE EMA20 H1: sekali saja saat trigger baru tersentuh, sebelum mulai scan M5 ──
+    if not setup.get('h1_ema_resolved'):
+        trig_ts = setup.get('h1_ema_trigger_ts')
+        if trig_ts is None:
+            trig_ts = float(df_m5['ts'].iloc[setup.get('m5_focus_idx', 0)]) if 'ts' in df_m5.columns else 0
+            setup['h1_ema_trigger_ts'] = trig_ts
+        resolved, final_dir, info = h1_ema_gate(df_h1, trig_ts, stype)
+        if not resolved:
+            print(f"   {coin} {stype}: menunggu gate EMA20 H1 — {info}")
+            return None
+        setup['h1_ema_resolved'] = True
+        setup['h1_ema_dir'] = final_dir
+        _mode = "IDM/FVG (searah)" if final_dir == stype else "EMA (arah DIBALIK)"
+        log_entry(f"   {coin}: gate EMA20 H1 selesai -> arah entry = {final_dir} [mode {_mode}] | {info}")
+    stype = setup['h1_ema_dir']   # dari sini pakai arah HASIL gate EMA H1 (bisa sama, bisa dibalik)
 
     def _ema_touched(i):
         """5 candle SEBELUM candle engulfing (i-5..i-1): minimal 1 harus BENAR-BENAR menyentuh
@@ -2533,7 +2615,9 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
     # ── WAIT_APPROACH ──
     if setup['phase'] == 'WAIT_APPROACH':
         entry = setup['entry']; dist = setup['dist']
-        side_order = "Buy" if stype == "Long" else "Sell"
+        # NB: side_order TIDAK dihitung di sini lagi — arah final baru pasti setelah gate EMA20 H1
+        # selesai (bisa searah stype asli, bisa dibalik "mode EMA"). Dipakai langsung dari
+        # engulf['side'] yang sudah dihitung check_m5_engulfing() memakai arah hasil gate.
 
         # ── PATH A: FVG monitor M5 setelah trigger1 (ujung gap) tersentuh ──
         # Tidak pakai APPROACH_R. Monitor dimulai begitu trigger1 tersentuh di M5.
@@ -2541,7 +2625,9 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
             c3_trig = float(setup.get('orig_ocl', entry))
             bos_rng = float(setup.get('bos_rng') or abs(float(setup.get('peak_val') or 0) - float(setup.get('choch_level') or 0)))
             if setup.get('m5_c1c_touched'):
-                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} trigger1:{c3_trig:.6f} | monitor engulfing M5...")
+                _dir_now = setup.get('h1_ema_dir') or stype
+                print(f"👁️  {coin} {stype} | now:{curr_price:.6f} trigger1:{c3_trig:.6f} | "
+                      f"arah:{_dir_now} | monitor engulfing M5...")
             else:
                 _pct_fvg = abs(curr_price - c3_trig) / c3_trig * 100 if c3_trig else 0
                 print(f"👁️  {coin} {stype} | now:{curr_price:.6f} trigger1:{c3_trig:.6f} | "
@@ -2550,11 +2636,13 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
             if active_count >= MAX_CONCURRENT:
                 print(f"\u23f8\ufe0f  {coin}: slot penuh ({active_count}/{MAX_CONCURRENT})")
                 return 'keep'
-            engulf = check_m5_engulfing(coin, setup, df_m5, bos_rng)
+            engulf = check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=df_h1_live)
             if engulf:
                 # Pasang LIMIT ORDER di ujung candle fokus (bukan market order)
                 limit_entry = engulf['entry']   # high fokus (Long) / low fokus (Short)
                 limit_sl    = engulf['sl']       # low fokus - buffer / high fokus + buffer
+                side_order  = engulf['side']     # 'Buy'/'Sell' — SUDAH pakai arah hasil gate EMA20 H1
+                final_dir   = setup.get('h1_ema_dir', stype)
                 oid = place_limit_order(coin, side_order, limit_entry, limit_sl)
                 if oid:
                     setup['phase']    = 'WAIT_FILL'
@@ -2562,13 +2650,14 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                     setup['entry']    = limit_entry
                     setup['sl']       = limit_sl
                     setup['dist']     = abs(limit_entry - limit_sl)
-                    print(f"\U0001f4cd {coin} {stype}: ENGULFING M5 → LIMIT @ {limit_entry:.6f} "
+                    _mode_lbl = "" if final_dir == stype else " [MODE EMA — arah dibalik]"
+                    print(f"\U0001f4cd {coin} {final_dir}: ENGULFING M5 → LIMIT @ {limit_entry:.6f} "
                           f"SL:{limit_sl:.6f} | break:{setup.get('swing_val'):.6g} "
-                          f"puncak:{setup.get('peak_val'):.6g}")
+                          f"puncak:{setup.get('peak_val'):.6g}{_mode_lbl}")
                     _eo = engulf.get('engulf_ohlc', {})
                     _so = engulf.get('sl_candle_ohlc', {})
                     log_entry(
-                        f"════ FVG ENGULF LIMIT {stype} {coin} @ {limit_entry:.6g} ════\n"
+                        f"════ FVG ENGULF LIMIT {final_dir} {coin} @ {limit_entry:.6g}{_mode_lbl} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
                         f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
@@ -2579,6 +2668,9 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                     return 'lock'
             return 'keep'
         # ── PATH B: Fallback limit (M5_ENGULF_FILTER=False) ──
+        # Jalur lama ini TIDAK lewat gate EMA20 H1 (murni retracement H1), jadi side_order tetap
+        # pakai stype asli.
+        side_order = "Buy" if stype == "Long" else "Sell"
         thr = APPROACH_R * dist
         approaching = (stype == 'Long'  and curr_price <= entry + thr) or                       (stype == 'Short' and curr_price >= entry - thr)
         r_now  = ((curr_price - entry) if stype == 'Long' else (entry - curr_price)) / dist if dist > 0 else 0
@@ -2611,10 +2703,14 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
         # Sudah dihapus atas permintaan — limit FVG SEKARANG hanya dibatalkan kalau BOS baru
         # terdeteksi di H1 (swing_val berubah), bukan karena harga lari jauh. Lihat run_bot loop
         # (blok "Re-deteksi DUA ARAH") untuk logika pembatalan BOS-baru itu.
-        pos = get_open_position(coin, 'Buy' if stype == 'Long' else 'Sell')
+        # final_stype = arah SESUNGGUHNYA dari order yang terpasang — hasil gate EMA20 H1 kalau
+        # lewat Path A (bisa sama dgn stype, bisa dibalik "mode EMA"), atau stype asli kalau lewat
+        # Path B (fallback lama, tak ada gate EMA, h1_ema_dir selalu None).
+        final_stype = setup.get('h1_ema_dir') or stype
+        pos = get_open_position(coin, 'Buy' if final_stype == 'Long' else 'Sell')
         if pos:
             entry_p = setup['entry']; sl_p = setup['sl']
-            side_order = "Buy" if stype == "Long" else "Sell"
+            side_order = "Buy" if final_stype == "Long" else "Sell"
             actual_entry = float(pos.get('avgPrice', entry_p))
             actual_dist  = abs(actual_entry - sl_p)
             min_dist = actual_entry * 0.002
@@ -2646,13 +2742,13 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                     print(f"⚠️ {coin}: set_trading_stop error: {e}"); time.sleep(2)
             if not trail_set_ok:
                 print(f"⚠️ {coin}: Trail gagal — retry M5 berikutnya")
-            active_positions[_akey(coin, stype)] = {
+            active_positions[_akey(coin, final_stype)] = {
                 'coin': coin,
                 'side': side_order, 'entry': actual_entry, 'sl': sl_p, 'dist': actual_dist,
                 'trail_dist': trail_d, 'trail_engaged': False, 'trail_set': trail_set_ok,
                 'last_price': actual_entry, 'entry_time': time.time(),
                 'peak': actual_entry, 'peak_time': time.time(),
-                'swing_val': setup.get('swing_val'), 'bos_type': stype, 'rev_count': 0,
+                'swing_val': setup.get('swing_val'), 'bos_type': final_stype, 'rev_count': 0,
                 'orig_ocl': setup.get('orig_ocl', setup.get('entry')),
                 'choch_level': setup.get('choch_level'), 'peak_val': setup.get('peak_val'),
                 'swing2': setup.get('swing2'),
@@ -2784,29 +2880,42 @@ def check_idm_pending():
                 'peak_val': trig + bos_rng_idm,
                 'choch_level': trig - bos_rng_idm,
                 'created_ts': p.get('placed_ts', 0),
+                'h1_ema_resolved': p.get('h1_ema_resolved', False),
+                'h1_ema_dir': p.get('h1_ema_dir'),
+                'h1_ema_trigger_ts': p.get('h1_ema_trigger_ts'),
             }
-            engulf = check_m5_engulfing(coin, m5_setup, df_m5_idm, bos_rng_idm)
+            # H1 cuma perlu di-fetch kalau gate EMA20 H1 belum selesai (hemat API call)
+            df_h1_idm = get_data(coin, "60", limit=50) if not m5_setup['h1_ema_resolved'] else None
+            engulf = check_m5_engulfing(coin, m5_setup, df_m5_idm, bos_rng_idm, df_h1=df_h1_idm)
             # Simpan state kembali ke idm_pending
             p['m5_triggered']         = m5_setup['m5_c1c_touched']
             p['m5_focus_hi']          = m5_setup['m5_focus_hi']
             p['m5_focus_lo']          = m5_setup['m5_focus_lo']
             p['m5_focus_idx']         = m5_setup['m5_focus_idx']
+            p['h1_ema_resolved']      = m5_setup['h1_ema_resolved']
+            p['h1_ema_dir']           = m5_setup['h1_ema_dir']
+            p['h1_ema_trigger_ts']    = m5_setup['h1_ema_trigger_ts']
             if engulf:
                 # Pasang LIMIT ORDER di ujung candle fokus M5 (sama seperti FVG)
                 limit_entry = engulf['entry']
                 limit_sl    = engulf['sl']
-                oid = place_limit_order(coin, p['side'], limit_entry, limit_sl)
+                final_dir   = p.get('h1_ema_dir') or e_stype_idm
+                side_final  = engulf['side']   # 'Buy'/'Sell' — SUDAH pakai arah hasil gate EMA20 H1
+                oid = place_limit_order(coin, side_final, limit_entry, limit_sl)
                 if oid:
                     p['order_id'] = oid
                     p['entry']    = limit_entry
                     p['sl']       = limit_sl
                     p['phase']    = 'WAIT_FILL'   # tandai sudah punya limit
-                    print(f"\U0001f4cd {coin}: IDM M5 ENGULF {e_stype_idm} → LIMIT @ {limit_entry:.6g} "
-                          f"SL:{limit_sl:.6g}")
+                    p['e_stype']  = final_dir     # arah final (bisa dibalik "mode EMA") dipakai seterusnya
+                    p['side']     = side_final    # dipakai check fill posisi (get_open_position) di atas
+                    _mode_lbl = "" if final_dir == e_stype_idm else " [MODE EMA — arah dibalik]"
+                    print(f"\U0001f4cd {coin}: IDM M5 ENGULF {final_dir} → LIMIT @ {limit_entry:.6g} "
+                          f"SL:{limit_sl:.6g}{_mode_lbl}")
                     _eo = engulf.get('engulf_ohlc', {})
                     _so = engulf.get('sl_candle_ohlc', {})
                     log_entry(
-                        f"════ IDM M5 ENGULF LIMIT {e_stype_idm} {coin} @ {limit_entry:.6g} ════\n"
+                        f"════ IDM M5 ENGULF LIMIT {final_dir} {coin} @ {limit_entry:.6g}{_mode_lbl} ════\n"
                         f"  Candle ENGULFING: open={_eo.get('open',0):.6g} high={_eo.get('high',0):.6g} "
                         f"low={_eo.get('low',0):.6g} close={_eo.get('close',0):.6g} "
                         f"→ entry = {limit_entry:.6g} (high/low candle sebelum engulfing)\n"
