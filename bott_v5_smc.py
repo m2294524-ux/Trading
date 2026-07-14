@@ -299,8 +299,8 @@ SL_CAP_RANGE     = 0.01   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANG
 SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False = SL ikut C1, di-cap 10% range
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
-INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 1.0 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
+INDUCEMENT_ZONE_LO = 0.0 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
+INDUCEMENT_ZONE_HI = 0.5 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -666,8 +666,8 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.0   # golden ratio / OTE — C1.close minimal retrace 61.8%
-ENTRY_ZONE_HI = 1.00
+ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_HI = 1.0
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
 FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setup hangus
@@ -778,9 +778,9 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
     trigger_ts_ms = waktu (ms) saat trigger H1 pertama tersentuh (dipakai cari candle H1 pertama
     yang relevan, mundur 1 jam supaya candle yang sedang berjalan saat trigger tersentuh ikut).
     direction = arah entry DEFAULT ('Long'/'Short') sebelum dipengaruhi EMA.
-    Return: (resolved: bool, final_direction: str|None, info: str)."""
+    Return: (resolved: bool, final_direction: str|None, info: str, decision_ts_close: float|None)."""
     if df_h1 is None or len(df_h1) == 0 or 'ts' not in df_h1.columns:
-        return False, None, "data H1 kosong"
+        return False, None, "data H1 kosong", None
     df = df_h1.copy()
     df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
     cutoff = trigger_ts_ms - 3600_000   # mundur 1 candle H1 (sama alasannya dgn fix created_ts M5)
@@ -788,7 +788,7 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
     n = len(seg)
     closed_end = n - 1   # jangan hitung candle H1 yang masih berjalan
     if closed_end < 1:
-        return False, None, "belum ada candle H1 closed sejak trigger tersentuh"
+        return False, None, "belum ada candle H1 closed sejak trigger tersentuh", None
 
     def _opp(d):
         return 'Short' if d == 'Long' else 'Long'
@@ -806,7 +806,7 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
             decision_idx = i
             break
     if decision_idx is None:
-        return False, None, "belum ada candle H1 (wick) yang menyentuh EMA20 sejak trigger tersentuh"
+        return False, None, "belum ada candle H1 (wick) yang menyentuh EMA20 sejak trigger tersentuh", None
 
     while decision_idx < closed_end:
         op  = float(seg['open'].iloc[decision_idx]); cl = float(seg['close'].iloc[decision_idx])
@@ -817,8 +817,9 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
             same_side = (above and direction == 'Long') or (not above and direction == 'Short')
             final_dir = direction if same_side else _opp(direction)
             mode = "IDM/FVG (searah)" if same_side else "EMA (dibalik)"
+            decision_ts_close = float(seg['ts'].iloc[decision_idx]) + 3600_000   # waktu CLOSE candle H1 ini
             return True, final_dir, (f"H1 {_ts_wib(seg['ts'].iloc[decision_idx])}: wick sentuh EMA20 & body "
-                                      f"{'di atas' if above else 'di bawah'} EMA20({ema:.6g}) -> mode {mode}")
+                                      f"{'di atas' if above else 'di bawah'} EMA20({ema:.6g}) -> mode {mode}"), decision_ts_close
         # EMA di tengah body (ambigu) -> cari candle SETELAHNYA yang wick-nya menyentuh EMA lagi
         found = None
         for j in range(decision_idx + 1, closed_end):
@@ -826,9 +827,9 @@ def h1_ema_gate(df_h1, trigger_ts_ms, direction):
                 found = j
                 break
         if found is None:
-            return False, None, "EMA di tengah body candle H1, menunggu candle H1 sentuh EMA lagi"
+            return False, None, "EMA di tengah body candle H1, menunggu candle H1 sentuh EMA lagi", None
         decision_idx = found   # candle retest ini jadi acuan keputusan baru, ulangi cek dari sini
-    return False, None, "menunggu candle H1 close berikutnya"
+    return False, None, "menunggu candle H1 close berikutnya", None
 
 
 def struct_touch_invalidated(df_m5, bos_stype, choch_level, peak_val):
@@ -2444,7 +2445,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
         if trig_ts is None:
             trig_ts = float(df_m5['ts'].iloc[setup.get('m5_focus_idx', 0)]) if 'ts' in df_m5.columns else 0
             setup['h1_ema_trigger_ts'] = trig_ts
-        resolved, final_dir, info = h1_ema_gate(df_h1, trig_ts, stype)
+        resolved, final_dir, info, decision_ts_close = h1_ema_gate(df_h1, trig_ts, stype)
         if not resolved:
             print(f"   {coin} {stype}: menunggu gate EMA20 H1 — {info}")
             return None
@@ -2452,6 +2453,26 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
         setup['h1_ema_dir'] = final_dir
         _mode = "IDM/FVG (searah)" if final_dir == stype else "EMA (arah DIBALIK)"
         log_entry(f"   {coin}: gate EMA20 H1 selesai -> arah entry = {final_dir} [mode {_mode}] | {info}")
+
+        # ── RESET fokus M5: cari engulfing BARU HANYA setelah H1 close yang lolos gate EMA ──
+        # Sebelumnya fokus M5 pertama dipakai dari titik trigger H1 tersentuh (sebelum gate
+        # dicek) — jadi bisa saja scan candle SEBELUM H1 close yang jadi acuan gate. Sekarang
+        # fokus di-reset: candle fokus pertama = candle M5 tepat SEBELUM candle M5 pertama yang
+        # CLOSE setelah waktu close H1 tsb (supaya _scan_engulf, yang mulai dari focus_idx+1,
+        # mulai persis dari candle M5 pertama yang close setelah H1 close itu).
+        if decision_ts_close is not None and 'ts' in df_m5.columns:
+            reset_idx = None
+            for k in range(closed_end):
+                # candle M5 k dianggap "close" pada ts+5menit; cari yang close-nya > decision_ts_close
+                if float(df_m5['ts'].iloc[k]) + 300_000 > decision_ts_close:
+                    reset_idx = k
+                    break
+            if reset_idx is not None and reset_idx > 0:
+                setup['m5_focus_idx'] = reset_idx - 1
+                setup['m5_focus_hi']  = float(df_m5['high'].iloc[reset_idx - 1])
+                setup['m5_focus_lo']  = float(df_m5['low'].iloc[reset_idx - 1])
+                log_entry(f"   {coin} {stype}: fokus M5 di-reset ke setelah H1 close -> fokus pertama = "
+                          f"M5 {_ts_wib(df_m5['ts'].iloc[reset_idx]) if 'ts' in df_m5.columns else reset_idx}")
     stype = setup['h1_ema_dir']   # dari sini pakai arah HASIL gate EMA H1 (bisa sama, bisa dibalik)
 
     def _ema_touched(i):
@@ -2773,6 +2794,20 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
         # lewat Path A (bisa sama dgn stype, bisa dibalik "mode EMA"), atau stype asli kalau lewat
         # Path B (fallback lama, tak ada gate EMA, h1_ema_dir selalu None).
         final_stype = setup.get('h1_ema_dir') or stype
+        # BUG FIX: sebelumnya di sini langsung percaya get_open_position(coin, side) — tapi itu bisa
+        # menemukan POSISI LAIN yang sudah ada duluan di sisi yang sama (mis. dari limit order LAIN
+        # yang sudah fill duluan), padahal order limit UNTUK SETUP INI ('order_id') sendiri belum
+        # filled sama sekali. Akibatnya SL posisi yang sudah ada tertimpa oleh SL setup yang order-nya
+        # belum fill. Sekarang wajib cek order_id milik setup ini benar2 Filled dulu.
+        oid = setup.get('order_id')
+        if oid and not _order_was_filled(coin, oid):
+            if _order_exists(coin, oid):
+                return 'keep'   # order masih pending di exchange, belum fill — jangan sentuh apapun
+            else:
+                # Order tidak ada lagi di exchange TAPI juga bukan Filled (kemungkinan cancelled/expired
+                # di luar kendali bot) — aman untuk dibuang, bukan dianggap fill.
+                print(f"⚠️ {coin} {stype}: order {oid} sudah tidak ada & bukan Filled — setup dibuang.")
+                return 'remove'
         pos = get_open_position(coin, 'Buy' if final_stype == 'Long' else 'Sell')
         if pos:
             entry_p = setup['entry']; sl_p = setup['sl']
@@ -2842,6 +2877,19 @@ def check_idm_pending():
     for key in list(idm_pending.keys()):
         p = idm_pending[key]
         coin, side = p['coin'], p['side']
+        # BUG FIX: sama seperti jalur FVG (process_setup/WAIT_FILL) — get_open_position(coin, side)
+        # bisa menemukan posisi lain yang sudah ada duluan di sisi yang sama (misal dari limit FVG
+        # yang sudah fill duluan di coin+arah yang sama), padahal order limit IDM ini ('order_id')
+        # sendiri belum fill (atau bahkan belum dipasang sama sekali — masih monitoring engulfing).
+        # Wajib verifikasi order_id benar2 Filled dulu sebelum sentuh SL/posisi.
+        oid = p.get('order_id')
+        if oid is None:
+            continue   # belum ada limit terpasang sama sekali (masih monitoring engulfing) — skip
+        if not _order_was_filled(coin, oid):
+            if not _order_exists(coin, oid):
+                print(f"⚠️ {coin} IDM: order {oid} sudah tidak ada & bukan Filled — dibuang.")
+                del idm_pending[key]
+            continue   # order masih pending (atau baru dibuang) — jangan sentuh apapun
         pos = get_open_position(coin, side)
         if pos is not None and float(pos.get('size', 0) or 0) > 0:
             entry = float(pos.get('avgPrice') or p['entry'])
