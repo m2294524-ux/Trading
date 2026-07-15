@@ -299,8 +299,8 @@ SL_CAP_RANGE     = 0.01   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANG
 SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False = SL ikut C1, di-cap 10% range
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
-INDUCEMENT_ZONE_LO = 0.0 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.5 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
+INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
+INDUCEMENT_ZONE_HI = 0.382 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -429,6 +429,37 @@ pending          = {}
 idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib retrace candle M5)
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
+
+def _bos_match(swing_val, choch_level, swing_val2, choch_level2):
+    """True kalau dua BOS besar SAMA PERSIS (dipakai cross-check IDM vs FVG di bawah)."""
+    if swing_val is None or choch_level is None or swing_val2 is None or choch_level2 is None:
+        return False
+    return abs(swing_val - swing_val2) < 1e-12 and abs(choch_level - choch_level2) < 1e-12
+
+def _fvg_trigger_touched_for_bos(coin, swing_val, choch_level):
+    """True kalau ADA setup FVG (pending[coin][d], arah manapun) untuk BOS besar SAMA PERSIS
+    (swing_val & choch_level identik) yang trigger-nya (c1c / orig_ocl) SUDAH tersentuh M5
+    (setup['m5_c1c_touched'] True). Dipakai IDM untuk cek apakah FVG "sudah ambil" arah itu."""
+    dirs = pending.get(coin)
+    if not dirs:
+        return False
+    for d, s in dirs.items():
+        if s.get('m5_c1c_touched') and _bos_match(s.get('swing_val'), s.get('choch_level'), swing_val, choch_level):
+            return True
+    return False
+
+def _idm_trigger_touched_for_bos(coin, swing_val, choch_level):
+    """True kalau ADA entri idm_pending untuk BOS besar SAMA PERSIS yang trigger-nya sudah
+    tersentuh (idm_pending selalu dibuat SETELAH trigger tersentuh -> keberadaan entri = tersentuh,
+    kecuali sudah hangus/dibuang). Dipakai FVG untuk cek apakah IDM "sudah ambil" arah itu."""
+    for key, p in idm_pending.items():
+        if p.get('coin') != coin:
+            continue
+        if p.get('m5_hangus'):
+            continue   # sudah hangus -> dianggap tidak lagi "mengambil" arah itu
+        if _bos_match(p.get('swing_val'), p.get('choch_level'), swing_val, choch_level):
+            return True
+    return False
 
 # ── Persistensi inducement_done ke file JSON (bertahan lewat redeploy/restart) ──
 # Path bisa dioverride via env var STATE_FILE_PATH (arahkan ke Railway Volume kalau ada,
@@ -666,8 +697,8 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
-ENTRY_ZONE_HI = 1.0
+ENTRY_ZONE_LO = 0.618   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
 FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setup hangus
@@ -1501,6 +1532,12 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
         else:
             breach_rows = m5_after_closed[m5_after_closed['high'] >= prot]
         if breach_rows.empty:
+            # ── Log tiap siklus: IDM menunggu trigger tersentuh (paritas dgn FVG "menunggu sentuhan") ──
+            e_stype_wait = "Short" if stype == "Long" else "Long"
+            curr_price_idm = float(df_m5['close'].iloc[-1])
+            _pct_idm = abs(curr_price_idm - prot) / prot * 100 if prot else 0
+            print(f"👁️  IDM {coin} {e_stype_wait} | now:{curr_price_idm:.6f} trigger:{prot:.6f} | "
+                  f"menunggu sentuhan ({_pct_idm:.2f}% lagi)")
             continue                       # IDM belum disapu (closed) sejak bot jalan -> tunggu
         # Sweep terjadi live setelah bot jalan → masuk idm_pending.
         sig = (stype, round(a['choch_level'], 10), round(a['swing_val'], 10))
@@ -1537,6 +1574,13 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     continue
 
             if IDM_M5_ENGULF:
+                # ── Cross-check: kalau FVG (arah searah BOS) untuk BOS besar SAMA PERSIS sudah
+                # tersentuh trigger-nya duluan, arah IDM ini (kebalikan BOS) jangan diambil —
+                # sudah "milik" FVG. Cegah risk dobel di coin+arah yang sama.
+                if _fvg_trigger_touched_for_bos(coin, a['swing_val'], a['choch_level']):
+                    print(f"⏭️ {coin}: IDM {stype} skip -> trigger FVG (searah BOS) sudah tersentuh duluan "
+                          f"untuk BOS besar ini, arah {e_stype} sudah diambil FVG")
+                    continue
                 # ── M5 ENGULF MODE: simpan state monitor, entry nanti saat engulfing dikonfirmasi ──
                 print(f"🎯 {coin}: IDM {stype} trigger={prot:.6g} tersapu → monitor M5 engulfing ({e_stype})")
                 idm_pending[_akey(coin, e_stype)] = {
@@ -1579,6 +1623,10 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                 return True
 
             # ── LIMIT MODE (IDM_M5_ENGULF=False, IDM_LIMIT_ENTRY=True) ──
+            if _fvg_trigger_touched_for_bos(coin, a['swing_val'], a['choch_level']):
+                print(f"⏭️ {coin}: IDM {stype} skip -> trigger FVG (searah BOS) sudah tersentuh duluan "
+                      f"untuk BOS besar ini, arah {e_stype} sudah diambil FVG")
+                continue
             pidx = idm.get('prot_idx')
             if pidx is None or pidx < 0 or pidx >= len(df_struct):
                 continue
@@ -2454,6 +2502,16 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
         _mode = "IDM/FVG (searah)" if final_dir == stype else "EMA (arah DIBALIK)"
         log_entry(f"   {coin}: gate EMA20 H1 selesai -> arah entry = {final_dir} [mode {_mode}] | {info}")
 
+        # ── Cross-check (FVG only): kalau gate EMA membalik arah FVG ini jadi KEBALIKAN BOS besar
+        # (sama dengan arah yang diambil IDM), dan IDM untuk BOS besar SAMA PERSIS sudah tersentuh
+        # trigger-nya, batalkan FVG ini — arah itu sudah "milik" IDM, cegah risk dobel.
+        if not setup.get('is_idm') and final_dir != stype:
+            _sv = setup.get('swing_val'); _cl = setup.get('choch_level')
+            if _idm_trigger_touched_for_bos(coin, _sv, _cl):
+                log_entry(f"🚫 {coin}: FVG {stype} dibatalkan — gate EMA membalik arah jadi {final_dir} "
+                          f"(kebalikan BOS), tapi IDM untuk BOS besar ini sudah tersentuh duluan")
+                return {'cancelled': True}
+
         # ── RESET fokus M5: cari engulfing BARU HANYA setelah H1 close yang lolos gate EMA ──
         # Sebelumnya fokus M5 pertama dipakai dari titik trigger H1 tersentuh (sebelum gate
         # dicek) — jadi bisa saja scan candle SEBELUM H1 close yang jadi acuan gate. Sekarang
@@ -2726,6 +2784,8 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
                 print(f"\u23f8\ufe0f  {coin}: slot penuh ({active_count}/{MAX_CONCURRENT})")
                 return 'keep'
             engulf = check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=df_h1_live)
+            if engulf and engulf.get('cancelled'):
+                return 'remove'   # cross-check: arah dibalik ini sudah "milik" IDM, batalkan FVG
             if engulf:
                 # Pasang LIMIT ORDER di ujung candle fokus (bukan market order)
                 limit_entry = engulf['entry']   # high fokus (Long) / low fokus (Short)
@@ -2937,6 +2997,15 @@ def check_idm_pending():
 
         # ── IDM WAIT_FILL: limit sudah terpasang — cancel jika CHOCH atau PUNCAK tersentuh M5 (wick) ──
         if IDM_M5_ENGULF and p.get('phase') == 'WAIT_FILL' and p.get('order_id'):
+            # Cross-check: trigger FVG (searah BOS) untuk BOS besar sama baru tersentuh SELAGI
+            # limit IDM ini masih WAIT_FILL (belum terisi) → cancel limit-nya juga.
+            if _fvg_trigger_touched_for_bos(coin, p.get('swing_val'), p.get('choch_level')):
+                cancel_order(coin, p['order_id'])
+                print(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — trigger FVG (searah BOS) "
+                      f"tersentuh duluan untuk BOS besar ini")
+                log_entry(f"🚫 {coin}: IDM {p['e_stype']} limit dibatalkan — trigger FVG tersentuh duluan (BOS besar sama)")
+                del idm_pending[key]
+                continue
             if p.get('peak_val') or p.get('choch_level'):
                 df_m5_c = get_data(coin, "5", limit=100)
                 if df_m5_c is not None and 'ts' in df_m5_c.columns:
@@ -2953,6 +3022,15 @@ def check_idm_pending():
 
         # ── IDM M5 ENGULF MODE ──
         if IDM_M5_ENGULF and p.get('order_id') is None and not p.get('m5_hangus'):
+            # Cross-check: kalau FVG (searah BOS) untuk BOS besar SAMA PERSIS baru tersentuh
+            # trigger-nya SELAGI IDM ini masih monitoring engulfing → batalkan monitoring IDM ini.
+            # Arah ini sudah "diambil" FVG, jangan dobel risk di coin+arah yang sama.
+            if _fvg_trigger_touched_for_bos(coin, p.get('swing_val'), p.get('choch_level')):
+                print(f"🚫 {coin}: IDM {p['e_stype']} dibatalkan — trigger FVG (searah BOS) tersentuh "
+                      f"duluan untuk BOS besar ini, arah sudah diambil FVG")
+                log_entry(f"🚫 {coin}: IDM {p['e_stype']} dibatalkan — trigger FVG tersentuh duluan (BOS besar sama)")
+                del idm_pending[key]
+                continue
             # Cek CHOCH atau puncak BOS besar tersentuh M5 (wick) → hangus permanen
             if p.get('peak_val') or p.get('choch_level'):
                 df_m5_pk = get_data(coin, "5", limit=100)
@@ -3002,6 +3080,9 @@ def check_idm_pending():
                 'h1_ema_resolved': p.get('h1_ema_resolved', False),
                 'h1_ema_dir': p.get('h1_ema_dir'),
                 'h1_ema_trigger_ts': p.get('h1_ema_trigger_ts'),
+                'bos_swing_val': p.get('swing_val'),      # BOS besar ASLI (bukan trig±bos_rng) — utk cross-check
+                'bos_choch_level': p.get('choch_level'),  # BOS besar ASLI — utk cross-check
+                'is_idm': True,
             }
             # H1 cuma perlu di-fetch kalau gate EMA20 H1 belum selesai (hemat API call)
             df_h1_idm = get_data(coin, "60", limit=50) if not m5_setup['h1_ema_resolved'] else None
@@ -3014,7 +3095,9 @@ def check_idm_pending():
             p['h1_ema_resolved']      = m5_setup['h1_ema_resolved']
             p['h1_ema_dir']           = m5_setup['h1_ema_dir']
             p['h1_ema_trigger_ts']    = m5_setup['h1_ema_trigger_ts']
-            if engulf:
+            if engulf and engulf.get('cancelled'):
+                pass   # cross-check hanya berlaku utk FVG (is_idm=True di sini) — seharusnya tak pernah terjadi
+            elif engulf:
                 # Pasang LIMIT ORDER di ujung candle fokus M5 (sama seperti FVG)
                 limit_entry = engulf['entry']
                 limit_sl    = engulf['sl']
