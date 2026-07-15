@@ -1597,11 +1597,13 @@ def check_inducement_entry(coin, df_h1, sh_h1, sl_h1):
                     'm5_triggered': True,   # sentuhan trigger H1 sudah pasti terjadi di candle `trig`
                     'm5_focus_hi': float(trig['high']), 'm5_focus_lo': float(trig['low']),
                     'm5_focus_idx': -1,
+                    'm5_focus_initialized': False,   # fokus scan sebenarnya baru diisi setelah gate EMA H1 selesai
                     'm5_hangus': False,
                     # Gate EMA20 H1 (dicek sekali saat trigger tersentuh, lihat h1_ema_gate()).
                     # trigger_ts langsung dari waktu candle `trig` (candle M5 yg terbukti menyapu
                     # trigger H1) — sudah pasti tahu persis kapan trigger tersentuh, tak perlu tunggu.
                     'h1_ema_resolved': False, 'h1_ema_dir': None, 'h1_ema_trigger_ts': float(trig['ts']),
+                    'h1_decision_ts_close': None,
                 }
                 inducement_done[(coin, stype)] = sig
                 save_state()
@@ -2379,8 +2381,10 @@ def build_setup_from_bos(coin, df_h1_live, sh_h1, sl_h1, closed_h1, verbose=True
         # M5 engulfing monitor state (1x engulfing, filter EMA20 M5 5-candle-sebelum di check_m5_engulfing)
         'm5_c1c_touched': False,
         'm5_focus_hi': 0.0, 'm5_focus_lo': 0.0, 'm5_focus_idx': 0,
+        'm5_focus_initialized': False,   # fokus scan sebenarnya baru diisi setelah gate EMA H1 selesai
         # Gate EMA20 H1 (dicek sekali saat trigger tersentuh, lihat h1_ema_gate())
         'h1_ema_resolved': False, 'h1_ema_dir': None, 'h1_ema_trigger_ts': None,
+        'h1_decision_ts_close': None,
     }
     return setup, logline
 
@@ -2409,20 +2413,39 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
     """Monitor M5 setelah trigger H1 tersentuh (C1 close untuk FVG lama / ujung gap utk FVG /
     trigger IDM). Cari konfirmasi engulfing untuk market order.
     Return: dict {'entry': float, 'sl': float, 'side': str} jika engulfing terkonfirmasi,
-            None jika belum ada konfirmasi.
-    State disimpan di setup dict:
-      'm5_c1c_touched' : bool  — apakah trigger H1 sudah tersentuh di M5
-      'm5_focus_hi'    : float — high candle fokus aktif
-      'm5_focus_lo'    : float — low candle fokus aktif
-      'm5_focus_idx'   : int   — index candle fokus di df_m5
+            {'cancelled': True} jika dibatalkan oleh cross-check IDM vs FVG,
+            None jika belum ada konfirmasi / masih menunggu fase berikutnya.
 
-    IDM dan FVG sekarang SAMA PERSIS: begitu trigger H1 tersentuh, candle M5 pertama yang
-    menyentuhnya LANGSUNG jadi fokus pertama — tidak ada lagi trigger2/tunggu candle kedua.
+    STATE MACHINE 3 FASE (eksplisit, masing-masing di-retry tiap siklus sampai berhasil —
+    TIDAK ADA fase yang mengasumsikan fase berikutnya langsung berhasil di siklus yang sama):
 
-    GATE EMA20 H1 (dicek SEKALI saja, tepat saat trigger H1 baru tersentuh — bukan tiap saat):
-    lihat h1_ema_gate(). Menentukan arah entry FINAL — bisa tetap searah IDM/FVG asli, atau
-    dibalik ("mode EMA") kalau body candle H1 berakhir di sisi berlawanan dari EMA20 H1. Baru
-    setelah gate ini selesai, monitoring M5 (di bawah) mulai jalan, memakai arah HASIL gate.
+      FASE 1 — WAIT_TRIGGER (state: 'm5_c1c_touched'):
+        Cari candle M5 pertama yang menyentuh trigger H1 (c1c/orig_ocl). Begitu ketemu, LANGSUNG
+        lanjut ke FASE 2 di siklus yang sama (tidak perlu tunggu siklus berikutnya) — tapi TIDAK
+        mengisi m5_focus_hi/lo/idx sama sekali (beda dari desain lama yang langsung menjadikan
+        candle trigger-touch ini sebagai fokus awal — itu sumber bug lama: fokus scan bisa mulai
+        dari SEBELUM H1 close yang jadi acuan gate EMA).
+
+      FASE 2 — WAIT_GATE (state: 'h1_ema_resolved', 'h1_decision_ts_close'):
+        Jalankan h1_ema_gate() sekali saja begitu trigger tersentuh. Bisa butuh beberapa candle H1
+        close sebelum lolos (return None di siklus2 sebelumnya, retry otomatis tiap siklus). Begitu
+        lolos: simpan arah final (h1_ema_dir) DAN 'h1_decision_ts_close' (waktu CLOSE candle H1 yang
+        jadi acuan keputusan gate) — dipakai FASE 3. Cross-check IDM vs FVG juga dicek di sini
+        (lihat _idm_trigger_touched_for_bos).
+
+      FASE 3 — WAIT_INIT_FOCUS (state: 'm5_focus_initialized'):
+        SETELAH gate lolos, cari candle M5 PERTAMA yang CLOSE setelah 'h1_decision_ts_close' —
+        candle SEBELUM itu yang dijadikan m5_focus_idx awal (supaya _scan_engulf, yang mulai dari
+        focus_idx+1, mulai PERSIS dari candle M5 pertama yang close setelah H1 close tsb). Kalau
+        df_m5 yang tersedia BELUM mencapai candle itu (window fetch belum sampai), fase ini
+        me-return None dan DICOBA LAGI di siklus berikutnya — TIDAK PERNAH jatuh ke fokus manapun
+        sebelum fase ini benar2 berhasil. Ini yang membedakan dari desain lama: sebelumnya reset
+        fokus hanya dicoba SEKALI (barengan dgn fase gate) — kalau df_m5 kebetulan belum cukup
+        panjang di siklus itu, reset gagal PERMANEN & fokus lama (dari FASE 1, sebelum H1 close)
+        yang kepakai selamanya. Fase 3 ini independen & retry-able, jadi tidak bisa gagal permanen.
+
+      Baru setelah FASE 3 selesai (m5_focus_initialized=True), scan engulfing (_scan_engulf) mulai
+      jalan dari fokus yang sudah pasti berada tepat setelah H1 close yang lolos gate EMA.
 
     FILTER EMA20 M5 (FVG maupun IDM), TIGA syarat, semuanya harus lolos:
       1. Salah satu dari 5 candle SEBELUM candle engulfing sudah menyentuh EMA20 M5 (EMA20 candle
@@ -2476,9 +2499,6 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
             touched = (stype == 'Long' and lo <= c1c) or (stype == 'Short' and hi >= c1c)
             if touched:
                 setup['m5_c1c_touched'] = True
-                setup['m5_focus_hi']    = hi
-                setup['m5_focus_lo']    = lo
-                setup['m5_focus_idx']   = i
                 if setup.get('h1_ema_trigger_ts') is None and 'ts' in df_m5.columns:
                     setup['h1_ema_trigger_ts'] = float(df_m5['ts'].iloc[i])
                 print(f"   {coin} {stype}: trigger H1 ({c1c:.6g}) tersentuh M5 idx={i} "
@@ -2486,12 +2506,16 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
                 break
         if not setup.get('m5_c1c_touched'):
             return None   # belum tersentuh
+        # CATATAN: 'm5_focus_hi/lo/idx' SENGAJA TIDAK di-set di sini lagi (beda dari desain lama).
+        # Fokus awal untuk scan engulfing HANYA boleh diinisialisasi SETELAH gate EMA H1 selesai
+        # DAN df_m5 sudah mencapai candle setelah H1 close (lihat fase WAIT_INIT_FOCUS di bawah) —
+        # supaya tidak ada jalur manapun yang bisa mulai scan dari fokus "sebelum H1 close".
 
     # ── GATE EMA20 H1: sekali saja saat trigger baru tersentuh, sebelum mulai scan M5 ──
     if not setup.get('h1_ema_resolved'):
         trig_ts = setup.get('h1_ema_trigger_ts')
         if trig_ts is None:
-            trig_ts = float(df_m5['ts'].iloc[setup.get('m5_focus_idx', 0)]) if 'ts' in df_m5.columns else 0
+            trig_ts = float(df_m5['ts'].iloc[0]) if 'ts' in df_m5.columns else 0
             setup['h1_ema_trigger_ts'] = trig_ts
         resolved, final_dir, info, decision_ts_close = h1_ema_gate(df_h1, trig_ts, stype)
         if not resolved:
@@ -2499,6 +2523,7 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
             return None
         setup['h1_ema_resolved'] = True
         setup['h1_ema_dir'] = final_dir
+        setup['h1_decision_ts_close'] = decision_ts_close   # dipakai fase WAIT_INIT_FOCUS di bawah
         _mode = "IDM/FVG (searah)" if final_dir == stype else "EMA (arah DIBALIK)"
         log_entry(f"   {coin}: gate EMA20 H1 selesai -> arah entry = {final_dir} [mode {_mode}] | {info}")
 
@@ -2511,27 +2536,36 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
                 log_entry(f"🚫 {coin}: FVG {stype} dibatalkan — gate EMA membalik arah jadi {final_dir} "
                           f"(kebalikan BOS), tapi IDM untuk BOS besar ini sudah tersentuh duluan")
                 return {'cancelled': True}
-
-        # ── RESET fokus M5: cari engulfing BARU HANYA setelah H1 close yang lolos gate EMA ──
-        # Sebelumnya fokus M5 pertama dipakai dari titik trigger H1 tersentuh (sebelum gate
-        # dicek) — jadi bisa saja scan candle SEBELUM H1 close yang jadi acuan gate. Sekarang
-        # fokus di-reset: candle fokus pertama = candle M5 tepat SEBELUM candle M5 pertama yang
-        # CLOSE setelah waktu close H1 tsb (supaya _scan_engulf, yang mulai dari focus_idx+1,
-        # mulai persis dari candle M5 pertama yang close setelah H1 close itu).
-        if decision_ts_close is not None and 'ts' in df_m5.columns:
-            reset_idx = None
-            for k in range(closed_end):
-                # candle M5 k dianggap "close" pada ts+5menit; cari yang close-nya > decision_ts_close
-                if float(df_m5['ts'].iloc[k]) + 300_000 > decision_ts_close:
-                    reset_idx = k
-                    break
-            if reset_idx is not None and reset_idx > 0:
-                setup['m5_focus_idx'] = reset_idx - 1
-                setup['m5_focus_hi']  = float(df_m5['high'].iloc[reset_idx - 1])
-                setup['m5_focus_lo']  = float(df_m5['low'].iloc[reset_idx - 1])
-                log_entry(f"   {coin} {stype}: fokus M5 di-reset ke setelah H1 close -> fokus pertama = "
-                          f"M5 {_ts_wib(df_m5['ts'].iloc[reset_idx]) if 'ts' in df_m5.columns else reset_idx}")
     stype = setup['h1_ema_dir']   # dari sini pakai arah HASIL gate EMA H1 (bisa sama, bisa dibalik)
+
+    # ── FASE WAIT_INIT_FOCUS: inisialisasi fokus M5 pertama SETELAH H1 close yang lolos gate ──
+    # Terpisah dari blok gate di atas (yang cuma jalan SEKALI) — fase ini DICOBA ULANG TIAP SIKLUS
+    # sampai berhasil, supaya tidak gagal permanen kalau di siklus yang sama dengan gate resolve,
+    # df_m5 yang ter-fetch belum sampai ke candle setelah H1 close (window fetch terbatas dsb).
+    # Sebelum fase ini berhasil, TIDAK ADA scan engulfing yang boleh jalan sama sekali.
+    if not setup.get('m5_focus_initialized'):
+        decision_ts_close = setup.get('h1_decision_ts_close')
+        if decision_ts_close is None or 'ts' not in df_m5.columns:
+            return None   # seharusnya tidak terjadi (gate sudah resolved), jaga-jaga saja
+        reset_idx = None
+        for k in range(closed_end):
+            # candle M5 k dianggap "close" pada ts+5menit; cari yang close-nya > decision_ts_close
+            if float(df_m5['ts'].iloc[k]) + 300_000 > decision_ts_close:
+                reset_idx = k
+                break
+        if reset_idx is None or reset_idx == 0:
+            # df_m5 belum mencapai candle setelah H1 close (atau candle itu justru candle M5
+            # PALING AWAL yang tersedia, tidak ada candle sebelumnya utk dijadikan fokus start) —
+            # tunggu siklus berikutnya, JANGAN mulai scan dari fokus manapun dulu.
+            print(f"   {coin} {stype}: menunggu candle M5 setelah H1 close ({_ts_wib(decision_ts_close)}) "
+                  f"untuk inisialisasi fokus pertama...")
+            return None
+        setup['m5_focus_idx'] = reset_idx - 1
+        setup['m5_focus_hi']  = float(df_m5['high'].iloc[reset_idx - 1])
+        setup['m5_focus_lo']  = float(df_m5['low'].iloc[reset_idx - 1])
+        setup['m5_focus_initialized'] = True
+        log_entry(f"   {coin} {stype}: fokus M5 pertama diinisialisasi setelah H1 close -> "
+                  f"M5 {_ts_wib(df_m5['ts'].iloc[reset_idx]) if 'ts' in df_m5.columns else reset_idx}")
 
     def _ema_touched(i):
         """5 candle SEBELUM candle engulfing (i-5..i-1): minimal 1 harus BENAR-BENAR menyentuh
@@ -3074,12 +3108,14 @@ def check_idm_pending():
                 'm5_focus_hi': p.get('m5_focus_hi', 0.0),
                 'm5_focus_lo': p.get('m5_focus_lo', 0.0),
                 'm5_focus_idx': p.get('m5_focus_idx', 0),
+                'm5_focus_initialized': p.get('m5_focus_initialized', False),
                 'peak_val': trig + bos_rng_idm,
                 'choch_level': trig - bos_rng_idm,
                 'created_ts': p.get('placed_ts', 0),
                 'h1_ema_resolved': p.get('h1_ema_resolved', False),
                 'h1_ema_dir': p.get('h1_ema_dir'),
                 'h1_ema_trigger_ts': p.get('h1_ema_trigger_ts'),
+                'h1_decision_ts_close': p.get('h1_decision_ts_close'),
                 'bos_swing_val': p.get('swing_val'),      # BOS besar ASLI (bukan trig±bos_rng) — utk cross-check
                 'bos_choch_level': p.get('choch_level'),  # BOS besar ASLI — utk cross-check
                 'is_idm': True,
@@ -3092,9 +3128,11 @@ def check_idm_pending():
             p['m5_focus_hi']          = m5_setup['m5_focus_hi']
             p['m5_focus_lo']          = m5_setup['m5_focus_lo']
             p['m5_focus_idx']         = m5_setup['m5_focus_idx']
+            p['m5_focus_initialized'] = m5_setup['m5_focus_initialized']
             p['h1_ema_resolved']      = m5_setup['h1_ema_resolved']
             p['h1_ema_dir']           = m5_setup['h1_ema_dir']
             p['h1_ema_trigger_ts']    = m5_setup['h1_ema_trigger_ts']
+            p['h1_decision_ts_close'] = m5_setup['h1_decision_ts_close']
             if engulf and engulf.get('cancelled'):
                 pass   # cross-check hanya berlaku utk FVG (is_idm=True di sini) — seharusnya tak pernah terjadi
             elif engulf:
