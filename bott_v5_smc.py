@@ -2553,16 +2553,20 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
             if float(df_m5['ts'].iloc[k]) + 300_000 > decision_ts_close:
                 reset_idx = k
                 break
-        if reset_idx is None or reset_idx == 0:
-            # df_m5 belum mencapai candle setelah H1 close (atau candle itu justru candle M5
-            # PALING AWAL yang tersedia, tidak ada candle sebelumnya utk dijadikan fokus start) —
-            # tunggu siklus berikutnya, JANGAN mulai scan dari fokus manapun dulu.
+        if reset_idx is None:
+            # df_m5 belum mencapai candle M5 yang close setelah H1 close — tunggu siklus berikutnya,
+            # JANGAN mulai scan dari fokus manapun dulu.
             print(f"   {coin} {stype}: menunggu candle M5 setelah H1 close ({_ts_wib(decision_ts_close)}) "
                   f"untuk inisialisasi fokus pertama...")
             return None
-        setup['m5_focus_idx'] = reset_idx - 1
-        setup['m5_focus_hi']  = float(df_m5['high'].iloc[reset_idx - 1])
-        setup['m5_focus_lo']  = float(df_m5['low'].iloc[reset_idx - 1])
+        # Fokus PERTAMA = candle M5 di reset_idx itu sendiri (candle yang CLOSE persis setelah H1
+        # close) — BUKAN candle sebelumnya. _scan_engulf mulai dari start_idx+1, jadi dengan fokus di
+        # reset_idx, candle PERTAMA yang benar2 discan sebagai calon engulfing adalah reset_idx+1
+        # (candle SETELAH candle-yang-baru-close-setelah-H1-close-itu) — persis sesuai maksud: candle
+        # M5 yang close setelah H1 close jadi fokus/acuan, candle setelahnya yang mulai dicari engulfing.
+        setup['m5_focus_idx'] = reset_idx
+        setup['m5_focus_hi']  = float(df_m5['high'].iloc[reset_idx])
+        setup['m5_focus_lo']  = float(df_m5['low'].iloc[reset_idx])
         setup['m5_focus_initialized'] = True
         log_entry(f"   {coin} {stype}: fokus M5 pertama diinisialisasi setelah H1 close -> "
                   f"M5 {_ts_wib(df_m5['ts'].iloc[reset_idx]) if 'ts' in df_m5.columns else reset_idx}")
