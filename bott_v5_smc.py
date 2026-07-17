@@ -697,7 +697,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.618   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.5   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
