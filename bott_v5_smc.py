@@ -2859,8 +2859,8 @@ def check_experimental_engulf(coin, df_m5):
         # Belum cross sampai batas window → cek apakah window sudah habis
         last_bar_no = (closed_end - 1) - start_i + 1
         if last_bar_no >= EXPERIMENTAL_EMA8_BARS:
-            print(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
-                  f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
+            log_entry(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
+                      f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
             st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
             st['m5_focus_idx'] = start_i
             st['ema8_wait'] = None
@@ -2922,6 +2922,10 @@ def check_experimental_engulf(coin, df_m5):
                   f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
                   f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
                   f"entry~{entry_p:.6g} SL={sl_p:.6g}")
+            log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
+                      f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
+                      f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
+                      f"entry~{entry_p:.6g} SL={sl_p:.6g}")
             st['ema8_wait'] = {
                 'stype': estype, 'engulf_idx': i, 'prev_hi': prev_hi, 'prev_lo': prev_lo,
                 'entry_p': entry_p, 'sl_p': sl_p, 'last_checked_idx': i - 1,
@@ -2938,9 +2942,15 @@ def check_experimental_engulf(coin, df_m5):
                 pass
             else:
                 f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
+                log_entry(f"   EXPERIMENTAL {coin}: fokus pindah ke M5 "
+                          f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
         else:
             if hi > f_hi or lo < f_lo:
                 f_hi = max(f_hi, hi); f_lo = min(f_lo, lo); focus_idx = i
+                log_entry(f"   EXPERIMENTAL {coin}: fokus pindah ke M5 "
+                          f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
 
     st['m5_focus_idx'] = focus_idx; st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
     st['range_base'] = range_base
