@@ -429,7 +429,7 @@ pending          = {}
 idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib retrace candle M5)
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
-experimental_pending = {}   # coin -> {'m5_focus_hi','m5_focus_lo','m5_focus_idx'} — state mode eksperimental (independen dari pending/idm_pending)
+experimental_pending = {}   # coin -> {'m5_focus_hi','m5_focus_lo','m5_focus_ts', ...} — state mode eksperimental (berbasis TIMESTAMP, bukan index; independen dari pending/idm_pending)
 
 def _bos_match(swing_val, choch_level, swing_val2, choch_level2):
     """True kalau dua BOS besar SAMA PERSIS (dipakai cross-check IDM vs FVG di bawah)."""
@@ -2749,6 +2749,14 @@ def check_experimental_engulf(coin, df_m5):
     gate EMA H1, tidak ada cross-check). Begitu bot start, tiap coin langsung monitoring M5 dari
     fokus paling awal yang tersedia, cari engulfing (Long & Short dipantau bersamaan).
 
+    PENTING — SEMUA state lintas-siklus disimpan sebagai TIMESTAMP (ts, ms), BUKAN index array.
+    df_m5 di-fetch ULANG tiap siklus (window 300 candle terbaru yang BERGESER seiring waktu) — index
+    absolut candle yang sama akan BERBEDA antar siklus (candle yg tadinya index 250 bisa jadi index
+    249 di siklus berikutnya begitu window geser). Kalau state disimpan sbg index array, di siklus
+    berikutnya index itu akan merujuk ke candle yang SALAH SAMA SEKALI — bug ini pernah terjadi
+    (fokus tidak pernah pindah, log kosong total setelah init). Sekarang tiap kali dipanggil, ts yang
+    tersimpan di-map ULANG ke index lokal df_m5 versi saat ini di awal fungsi.
+
     ATURAN (per arah):
       1. Fokus & pindah fokus & range-base: PERSIS sama seperti _scan_engulf() di check_m5_engulfing
          (candle fokus geser tiap kali ada candle close yang melewati hi/lo fokus; kalau harga masuk
@@ -2770,55 +2778,66 @@ def check_experimental_engulf(coin, df_m5):
          (default 0%, jadi persis high/low candle i-1, TANPA buffer tambahan — beda dari SL_ENGULF_PCT
          jalur IDM/FVG yang berbasis % range BOS besar, karena di sini TIDAK ADA BOS besar sama sekali).
 
-    State disimpan di experimental_pending[coin]:
-      'm5_focus_hi'/'m5_focus_lo'/'m5_focus_idx' : fokus aktif SAAT INI (dipakai utk SEMUA arah —
-          begitu salah satu arah entry atau salah satu candle jadi fokus baru, brlaku utk keduanya,
-          sama seperti pola pending FVG asli yang scan 1 arah tapi index waktu sama utk semua coin).
+    State disimpan di experimental_pending[coin] (SEMUA berbasis TIMESTAMP, bukan index):
+      'm5_focus_ts'/'m5_focus_hi'/'m5_focus_lo' : fokus aktif SAAT INI.
       'range_base' : bool — status range-base mode aktif tidaknya.
       'ema8_wait'  : dict atau None — kalau sedang menunggu cross EMA8/EMA20 setelah lolos syarat (2a):
-          {'stype': 'Long'/'Short', 'engulf_idx': int, 'prev_hi': float, 'prev_lo': float,
-           'bars_left': int, 'entry_p': float, 'sl_p': float}
+          {'stype': 'Long'/'Short', 'engulf_ts': float, 'prev_hi': float, 'prev_lo': float,
+           'entry_p': float, 'sl_p': float, 'last_checked_ts': float}
     """
     global experimental_pending
-    if df_m5 is None or len(df_m5) < 10:
+    if df_m5 is None or len(df_m5) < 10 or 'ts' not in df_m5.columns:
         return
-    df_m5 = df_m5.copy()
+    df_m5 = df_m5.copy().reset_index(drop=True)
     df_m5['ema8']  = df_m5['close'].ewm(span=8,  adjust=False).mean()
     df_m5['ema20'] = df_m5['close'].ewm(span=20, adjust=False).mean()
     n = len(df_m5)
     closed_end = n - 1   # exclude candle yang masih berjalan
+
+    def _idx_of_ts(ts_val):
+        """Cari index lokal di df_m5 SAAT INI untuk timestamp yang tersimpan. None kalau tidak ada
+        (misal window fetch sudah bergeser jauh sehingga candle itu tidak lagi ter-cover)."""
+        matches = df_m5.index[df_m5['ts'] == ts_val]
+        return int(matches[0]) if len(matches) else None
 
     st = experimental_pending.get(coin)
     if st is None:
         # Inisialisasi pertama kali (termasuk setelah redeploy — state ini murni in-memory, TIDAK
         # persist): fokus = candle M5 TERAKHIR yang sudah closed SAAT INI, BUKAN candle paling awal
         # di window fetch (candle 300 candle lalu). Kalau pakai candle awal, begitu redeploy bot akan
-        # "menemukan" lagi engulfing2 LAMA dari histori yang sebenarnya sudah basi, dan bisa langsung
-        # entry pakai kondisi yang sudah lewat — bukan candle live yang baru terbentuk setelah bot
-        # mulai jalan. Dengan fokus di closed_end-1 (candle live terakhir), _scan_engulf hanya akan
-        # mulai memeriksa dari candle SETELAHNYA — yaitu candle live yang baru closed SETELAH ini.
+        # "menemukan" lagi engulfing2 LAMA dari histori yang sebenarnya sudah basi.
         last_idx = closed_end - 1
         if last_idx < 0:
             return   # data terlalu pendek, tunggu siklus berikutnya
         st = {
+            'm5_focus_ts': float(df_m5['ts'].iloc[last_idx]),
             'm5_focus_hi': float(df_m5['high'].iloc[last_idx]),
             'm5_focus_lo': float(df_m5['low'].iloc[last_idx]),
-            'm5_focus_idx': last_idx,
             'range_base': False,
             'ema8_wait': None,
         }
         experimental_pending[coin] = st
         print(f"👁️  EXPERIMENTAL {coin}: mulai monitoring M5 dari candle live terakhir "
-              f"({_ts_wib(df_m5['ts'].iloc[last_idx]) if 'ts' in df_m5.columns else last_idx}, "
+              f"({_ts_wib(df_m5['ts'].iloc[last_idx])}, "
               f"hi={st['m5_focus_hi']:.6g} lo={st['m5_focus_lo']:.6g}) — engulfing lama diabaikan")
+        return   # baru inisialisasi — scan candle berikutnya mulai siklus berikutnya (data belum ada)
 
     # ── Kalau sedang menunggu cross EMA8/EMA20 (fase 2b/2c) ──
     ew = st.get('ema8_wait')
     if ew is not None:
-        start_i = ew['engulf_idx']   # candle engulfing = candle ke-1 di window tunggu
-        # Cek candle2 baru yang belum diperiksa (dari candle terakhir yg sudah dicek s/d closed_end)
-        last_checked = ew.get('last_checked_idx', start_i - 1)
-        for i in range(last_checked + 1, closed_end):
+        start_i = _idx_of_ts(ew['engulf_ts'])
+        if start_i is None:
+            # Candle engulfing acuan sudah keluar dari window fetch (jarang terjadi, window 300
+            # candle = ~25 jam data M5) — batalkan wait, mulai scan fokus dari awal window baru.
+            log_entry(f"⚠️ EXPERIMENTAL {coin} {ew['stype']}: candle engulfing acuan sudah di luar "
+                      f"window data — wait dibatalkan")
+            st['ema8_wait'] = None
+            return
+        last_checked_ts = ew.get('last_checked_ts')
+        last_checked_i = _idx_of_ts(last_checked_ts) if last_checked_ts is not None else start_i - 1
+        if last_checked_i is None:
+            last_checked_i = start_i - 1
+        for i in range(last_checked_i + 1, closed_end):
             bar_no = i - start_i + 1   # candle engulfing sendiri = bar_no 1
             if bar_no > EXPERIMENTAL_EMA8_BARS:
                 break
@@ -2835,7 +2854,7 @@ def check_experimental_engulf(coin, df_m5):
                 curr_price = float(df_m5['close'].iloc[i])
                 side = 'Buy' if ew['stype'] == 'Long' else 'Sell'
                 print(f"✅ EXPERIMENTAL {coin} {ew['stype']}: EMA8 cross EMA20 @ candle ke-{bar_no} "
-                      f"({_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i}) → MARKET ENTRY")
+                      f"({_ts_wib(df_m5['ts'].iloc[i])}) → MARKET ENTRY")
                 log_entry(f"════ EXPERIMENTAL MARKET {ew['stype']} {coin} — EMA8 cross EMA20 "
                           f"(candle ke-{bar_no}/{EXPERIMENTAL_EMA8_BARS}) ════\n"
                           f"  entry~{curr_price:.6g} SL={ew['sl_p']:.6g}")
@@ -2853,7 +2872,7 @@ def check_experimental_engulf(coin, df_m5):
                     }
                 # Fokus baru = candle engulfing yang barusan dipakai (sama seperti pola pindah fokus)
                 st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
-                st['m5_focus_idx'] = start_i
+                st['m5_focus_ts'] = ew['engulf_ts']
                 st['ema8_wait'] = None
                 return
         # Belum cross sampai batas window → cek apakah window sudah habis
@@ -2862,14 +2881,23 @@ def check_experimental_engulf(coin, df_m5):
             log_entry(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
                       f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
             st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
-            st['m5_focus_idx'] = start_i
+            st['m5_focus_ts'] = ew['engulf_ts']
             st['ema8_wait'] = None
         else:
-            st['ema8_wait']['last_checked_idx'] = closed_end - 1
+            st['ema8_wait']['last_checked_ts'] = float(df_m5['ts'].iloc[closed_end - 1])
         return   # entry belum terjadi (nunggu cross ATAU baru saja dibatalkan) — scan fokus baru mulai siklus berikutnya
 
     # ── Scan fokus normal (belum ada calon engulfing yang lolos EMA-prev) ──
-    focus_idx = st['m5_focus_idx']
+    focus_idx = _idx_of_ts(st.get('m5_focus_ts'))
+    if focus_idx is None:
+        # Fokus lama sudah keluar window (jarang) — reset fokus ke candle live terakhir lagi.
+        focus_idx = closed_end - 1
+        if focus_idx < 0:
+            return
+        st['m5_focus_ts'] = float(df_m5['ts'].iloc[focus_idx])
+        st['m5_focus_hi'] = float(df_m5['high'].iloc[focus_idx])
+        st['m5_focus_lo'] = float(df_m5['low'].iloc[focus_idx])
+        log_entry(f"⚠️ EXPERIMENTAL {coin}: fokus lama di luar window data — di-reset ke candle live terakhir")
     f_hi = st['m5_focus_hi']; f_lo = st['m5_focus_lo']
     range_base = st.get('range_base', False)
     for i in range(focus_idx + 1, closed_end):
@@ -2927,10 +2955,10 @@ def check_experimental_engulf(coin, df_m5):
                       f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
                       f"entry~{entry_p:.6g} SL={sl_p:.6g}")
             st['ema8_wait'] = {
-                'stype': estype, 'engulf_idx': i, 'prev_hi': prev_hi, 'prev_lo': prev_lo,
-                'entry_p': entry_p, 'sl_p': sl_p, 'last_checked_idx': i - 1,
+                'stype': estype, 'engulf_ts': float(df_m5['ts'].iloc[i]), 'prev_hi': prev_hi, 'prev_lo': prev_lo,
+                'entry_p': entry_p, 'sl_p': sl_p, 'last_checked_ts': float(df_m5['ts'].iloc[i-1]),
             }
-            st['m5_focus_idx'] = focus_idx; st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
+            st['m5_focus_ts'] = float(df_m5['ts'].iloc[focus_idx]); st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
             st['range_base'] = range_base
             return
 
@@ -2952,7 +2980,7 @@ def check_experimental_engulf(coin, df_m5):
                           f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
                           f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
 
-    st['m5_focus_idx'] = focus_idx; st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
+    st['m5_focus_ts'] = float(df_m5['ts'].iloc[focus_idx]); st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
     st['range_base'] = range_base
 
 
