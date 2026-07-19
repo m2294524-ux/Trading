@@ -276,8 +276,8 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 4.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_ACT_R      = 9.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -719,10 +719,10 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 # tiap kali ada candle yang melewati hi/lo fokus, sama seperti aturan dasar _scan_engulf biasa).
 # TIDAK ADA gate EMA H1, TIDAK ADA cross-check IDM/FVG, TIDAK ADA BOS besar sama sekali — market
 # order langsung begitu syarat di bawah terpenuhi.
-EXPERIMENTAL_MODE     = True   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
+EXPERIMENTAL_MODE     = True    # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
-EXPERIMENTAL_SL_PCT   = 0.0     # 0 = SL langsung di ujung candle sebelum engulfing (tanpa buffer tambahan)
+EXPERIMENTAL_SL_PCT   = 0.30    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
 EXPERIMENTAL_NO_CROSS_BARS = 20 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
@@ -2774,9 +2774,10 @@ def check_experimental_engulf(coin, df_m5):
             jadi <EMA20) di salah satu candle dalam window itu → entry MARKET langsung saat cross.
          c. Kalau sampai candle ke-(EXPERIMENTAL_EMA8_BARS) belum ada cross → dibatalkan, fokus pindah
             ke candle engulfing tsb (seperti penolakan biasa), lanjut cari engulfing berikutnya.
-      3. Entry = MARKET (bukan limit). SL = ujung candle SEBELUM engulfing (i-1) ± EXPERIMENTAL_SL_PCT
-         (default 0%, jadi persis high/low candle i-1, TANPA buffer tambahan — beda dari SL_ENGULF_PCT
-         jalur IDM/FVG yang berbasis % range BOS besar, karena di sini TIDAK ADA BOS besar sama sekali).
+      3. Entry = MARKET (bukan limit). SL = harga entry AKTUAL (saat cross terjadi) ± EXPERIMENTAL_SL_PCT%
+         dari entry — dihitung ulang di titik entry sebenarnya, BUKAN dari ujung candle sebelum
+         engulfing (itu bisa lebar/sempit random tergantung besar candle; sekarang selalu proporsional
+         & konsisten terhadap harga, sesuai permintaan user).
 
     State disimpan di experimental_pending[coin] (SEMUA berbasis TIMESTAMP, bukan index):
       'm5_focus_ts'/'m5_focus_hi'/'m5_focus_lo' : fokus aktif SAAT INI.
@@ -2853,16 +2854,21 @@ def check_experimental_engulf(coin, df_m5):
             if crossed:
                 curr_price = float(df_m5['close'].iloc[i])
                 side = 'Buy' if ew['stype'] == 'Long' else 'Sell'
+                # SL = entry AKTUAL ± EXPERIMENTAL_SL_PCT% (dihitung dari harga entry sebenarnya saat
+                # cross terjadi, BUKAN dari ujung candle sebelum engulfing — supaya jarak SL selalu
+                # proporsional & konsisten, tidak lebar/sempit random tergantung besar candle).
+                sl_buf = curr_price * (EXPERIMENTAL_SL_PCT / 100.0)
+                sl_p = (curr_price - sl_buf) if ew['stype'] == 'Long' else (curr_price + sl_buf)
                 print(f"✅ EXPERIMENTAL {coin} {ew['stype']}: EMA8 cross EMA20 @ candle ke-{bar_no} "
                       f"({_ts_wib(df_m5['ts'].iloc[i])}) → MARKET ENTRY")
                 log_entry(f"════ EXPERIMENTAL MARKET {ew['stype']} {coin} — EMA8 cross EMA20 "
                           f"(candle ke-{bar_no}/{EXPERIMENTAL_EMA8_BARS}) ════\n"
-                          f"  entry~{curr_price:.6g} SL={ew['sl_p']:.6g}")
-                oid, qty = place_market_entry(coin, side, curr_price, ew['sl_p'], 0)
+                          f"  entry~{curr_price:.6g} SL={sl_p:.6g} ({EXPERIMENTAL_SL_PCT:.2f}% dari entry)")
+                oid, qty = place_market_entry(coin, side, curr_price, sl_p, 0)
                 if oid:
-                    dist = abs(curr_price - ew['sl_p'])
+                    dist = abs(curr_price - sl_p)
                     active_positions[_akey(coin, ew['stype'])] = {
-                        'coin': coin, 'side': side, 'entry': curr_price, 'sl': ew['sl_p'],
+                        'coin': coin, 'side': side, 'entry': curr_price, 'sl': sl_p,
                         'dist': dist, 'trail_dist': TRAIL_STOP * dist,
                         'trail_engaged': False, 'trail_set': False,
                         'last_price': curr_price, 'entry_time': time.time(),
@@ -2943,20 +2949,22 @@ def check_experimental_engulf(coin, df_m5):
                 f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
                 continue
             # Lolos syarat EMA-prev → mulai tunggu cross EMA8/EMA20
-            entry_p = prev_hi if estype == 'Long' else prev_lo
-            sl_buf  = EXPERIMENTAL_SL_PCT * abs(prev_hi - prev_lo)
-            sl_p    = (prev_lo - sl_buf) if estype == 'Long' else (prev_hi + sl_buf)
+            # SL BARU dihitung nanti di titik entry AKTUAL (cross terjadi) — persentase dari harga
+            # entry sebenarnya, BUKAN dari ujung candle sebelum engulfing (itu bisa lebar/sempit
+            # random tergantung besar candle; sekarang selalu proporsional EXPERIMENTAL_SL_PCT dari
+            # harga entry beneran).
+            entry_p_est = prev_hi if estype == 'Long' else prev_lo   # cuma estimasi utk log, bukan SL final
             print(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
                   f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
                   f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
-                  f"entry~{entry_p:.6g} SL={sl_p:.6g}")
+                  f"entry~{entry_p_est:.6g}")
             log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
                       f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
                       f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
-                      f"entry~{entry_p:.6g} SL={sl_p:.6g}")
+                      f"entry~{entry_p_est:.6g}")
             st['ema8_wait'] = {
                 'stype': estype, 'engulf_ts': float(df_m5['ts'].iloc[i]), 'prev_hi': prev_hi, 'prev_lo': prev_lo,
-                'entry_p': entry_p, 'sl_p': sl_p, 'last_checked_ts': float(df_m5['ts'].iloc[i-1]),
+                'last_checked_ts': float(df_m5['ts'].iloc[i-1]),
             }
             st['m5_focus_ts'] = float(df_m5['ts'].iloc[focus_idx]); st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
             st['range_base'] = range_base
