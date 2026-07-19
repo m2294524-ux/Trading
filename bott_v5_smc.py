@@ -719,7 +719,7 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 # tiap kali ada candle yang melewati hi/lo fokus, sama seperti aturan dasar _scan_engulf biasa).
 # TIDAK ADA gate EMA H1, TIDAK ADA cross-check IDM/FVG, TIDAK ADA BOS besar sama sekali — market
 # order langsung begitu syarat di bawah terpenuhi.
-EXPERIMENTAL_MODE     = False   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
+EXPERIMENTAL_MODE     = True   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
 EXPERIMENTAL_SL_PCT   = 0.0     # 0 = SL langsung di ujung candle sebelum engulfing (tanpa buffer tambahan)
