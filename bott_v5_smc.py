@@ -289,7 +289,7 @@ SBR_MODE         = True   # True = SBR entry di C1.close + SL di C1.low, False =
 ENTRY_MODE       = 'fvg_limit'  # limit di zona FVG (satu-satunya jalur)
 TOUCH_VOL_MIN    = 0.8    # touch candle volume min (× avg 20 M5 candle) — hanya dipakai fvg_sbr
 MAX_GAP_PCT      = 0.0    # 0 = TANPA BATAS gap (entry=C1.close, SL=C1.low — lebar gap tak ngaruh)
-MAX_CONCURRENT   = 12     # PLAFON KEAMANAN posisi bersamaan (backstop). Pembatas utama = MARGIN.
+MAX_CONCURRENT   = 5     # PLAFON KEAMANAN posisi bersamaan (backstop). Pembatas utama = MARGIN.
                           # ⚠️ tiap posisi risiko ~1% → 12 posisi = ~12% jika semua kena SL serentak
                           #    (alt sering jatuh berkorelasi!). Turunkan kalau mau lebih aman.
 APPROACH_R       = 2.0    # place limit saat harga dalam 1R dari entry (ujung wick C2)
@@ -719,10 +719,11 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 # tiap kali ada candle yang melewati hi/lo fokus, sama seperti aturan dasar _scan_engulf biasa).
 # TIDAK ADA gate EMA H1, TIDAK ADA cross-check IDM/FVG, TIDAK ADA BOS besar sama sekali — market
 # order langsung begitu syarat di bawah terpenuhi.
-EXPERIMENTAL_MODE     = True   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
+EXPERIMENTAL_MODE     = False   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
 EXPERIMENTAL_SL_PCT   = 0.0     # 0 = SL langsung di ujung candle sebelum engulfing (tanpa buffer tambahan)
+EXPERIMENTAL_NO_CROSS_BARS = 20 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2755,11 +2756,14 @@ def check_experimental_engulf(coin, df_m5):
       2. Begitu ada candle yang close melewati fokus (calon engulfing, candle index i):
          a. Candle SEBELUM engulfing (i-1) wick-nya WAJIB menyentuh EMA20 M5 (low<=ema20<=high) —
             HANYA candle i-1 yang dicek (beda dari filter M5 biasa yang cek 5 candle sebelum).
-         b. Kalau (a) lolos, entry TIDAK langsung terjadi di sini — mulai "menunggu cross EMA8/EMA20"
-            selama EXPERIMENTAL_EMA8_BARS candle (termasuk candle engulfing itu sendiri sebagai
-            candle ke-1, jadi candle ke-1 s/d ke-(EXPERIMENTAL_EMA8_BARS)). Kalau EMA8 cross EMA20
-            SEARAH engulfing (Long: EMA8 dari <=EMA20 jadi >EMA20; Short: EMA8 dari >=EMA20 jadi
-            <EMA20) di salah satu candle dalam window itu → entry MARKET langsung saat cross terjadi.
+         a2. TIDAK boleh ada EMA8/EMA20 cross (arah manapun) di EXPERIMENTAL_NO_CROSS_BARS candle
+            SEBELUM engulfing (i-N..i-1, default N=20) — memastikan tren sudah stabil dulu sebelum
+            candle engulfing terbentuk (bukan baru saja whipsaw/choppy).
+         b. Kalau (a) dan (a2) lolos, entry TIDAK langsung terjadi di sini — mulai "menunggu cross
+            EMA8/EMA20" selama EXPERIMENTAL_EMA8_BARS candle (termasuk candle engulfing itu sendiri
+            sebagai candle ke-1, jadi candle ke-1 s/d ke-(EXPERIMENTAL_EMA8_BARS)). Kalau EMA8 cross
+            EMA20 SEARAH engulfing (Long: EMA8 dari <=EMA20 jadi >EMA20; Short: EMA8 dari >=EMA20
+            jadi <EMA20) di salah satu candle dalam window itu → entry MARKET langsung saat cross.
          c. Kalau sampai candle ke-(EXPERIMENTAL_EMA8_BARS) belum ada cross → dibatalkan, fokus pindah
             ke candle engulfing tsb (seperti penolakan biasa), lanjut cari engulfing berikutnya.
       3. Entry = MARKET (bukan limit). SL = ujung candle SEBELUM engulfing (i-1) ± EXPERIMENTAL_SL_PCT
@@ -2786,17 +2790,27 @@ def check_experimental_engulf(coin, df_m5):
 
     st = experimental_pending.get(coin)
     if st is None:
-        # Inisialisasi pertama kali: fokus = candle paling awal yang tersedia (candle ke-0)
+        # Inisialisasi pertama kali (termasuk setelah redeploy — state ini murni in-memory, TIDAK
+        # persist): fokus = candle M5 TERAKHIR yang sudah closed SAAT INI, BUKAN candle paling awal
+        # di window fetch (candle 300 candle lalu). Kalau pakai candle awal, begitu redeploy bot akan
+        # "menemukan" lagi engulfing2 LAMA dari histori yang sebenarnya sudah basi, dan bisa langsung
+        # entry pakai kondisi yang sudah lewat — bukan candle live yang baru terbentuk setelah bot
+        # mulai jalan. Dengan fokus di closed_end-1 (candle live terakhir), _scan_engulf hanya akan
+        # mulai memeriksa dari candle SETELAHNYA — yaitu candle live yang baru closed SETELAH ini.
+        last_idx = closed_end - 1
+        if last_idx < 0:
+            return   # data terlalu pendek, tunggu siklus berikutnya
         st = {
-            'm5_focus_hi': float(df_m5['high'].iloc[0]),
-            'm5_focus_lo': float(df_m5['low'].iloc[0]),
-            'm5_focus_idx': 0,
+            'm5_focus_hi': float(df_m5['high'].iloc[last_idx]),
+            'm5_focus_lo': float(df_m5['low'].iloc[last_idx]),
+            'm5_focus_idx': last_idx,
             'range_base': False,
             'ema8_wait': None,
         }
         experimental_pending[coin] = st
-        print(f"👁️  EXPERIMENTAL {coin}: mulai monitoring M5 dari fokus awal "
-              f"(hi={st['m5_focus_hi']:.6g} lo={st['m5_focus_lo']:.6g})")
+        print(f"👁️  EXPERIMENTAL {coin}: mulai monitoring M5 dari candle live terakhir "
+              f"({_ts_wib(df_m5['ts'].iloc[last_idx]) if 'ts' in df_m5.columns else last_idx}, "
+              f"hi={st['m5_focus_hi']:.6g} lo={st['m5_focus_lo']:.6g}) — engulfing lama diabaikan")
 
     # ── Kalau sedang menunggu cross EMA8/EMA20 (fase 2b/2c) ──
     ew = st.get('ema8_wait')
@@ -2882,6 +2896,22 @@ def check_experimental_engulf(coin, df_m5):
                 log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
                           f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
                           f"DITOLAK (candle sebelum engulfing tak sentuh EMA20)")
+                f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
+                continue
+            # Filter tambahan: EXPERIMENTAL_NO_CROSS_BARS candle SEBELUM engulfing (i-N..i-1) tidak
+            # boleh ada EMA8 cross EMA20 sama sekali (arah manapun) — kalau ada, dianggap trennya
+            # belum cukup stabil.
+            no_recent_cross = True
+            for j in range(max(1, i - EXPERIMENTAL_NO_CROSS_BARS), i):
+                e8_j, e20_j = float(df_m5['ema8'].iloc[j]), float(df_m5['ema20'].iloc[j])
+                e8_jp, e20_jp = float(df_m5['ema8'].iloc[j-1]), float(df_m5['ema20'].iloc[j-1])
+                if (e8_jp <= e20_jp and e8_j > e20_j) or (e8_jp >= e20_jp and e8_j < e20_j):
+                    no_recent_cross = False
+                    break
+            if not no_recent_cross:
+                log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
+                          f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"DITOLAK (ada EMA8/EMA20 cross dalam 20 candle sebelumnya)")
                 f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
                 continue
             # Lolos syarat EMA-prev → mulai tunggu cross EMA8/EMA20
