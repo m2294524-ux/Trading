@@ -300,7 +300,7 @@ SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False =
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
 INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
-INDUCEMENT_ZONE_HI = 0.50 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
+INDUCEMENT_ZONE_HI = 1.0 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
 INDUCEMENT_SWING_MAX = 5   # IDM di-SKIP bila kekuatan swing >= ini di KEDUA sisi (= SWING_BARS; skala BOS besar 5-5+)
@@ -429,6 +429,7 @@ pending          = {}
 idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib retrace candle M5)
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
+experimental_pending = {}   # coin -> {'m5_focus_hi','m5_focus_lo','m5_focus_idx'} — state mode eksperimental (independen dari pending/idm_pending)
 
 def _bos_match(swing_val, choch_level, swing_val2, choch_level2):
     """True kalau dua BOS besar SAMA PERSIS (dipakai cross-check IDM vs FVG di bawah)."""
@@ -697,7 +698,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 0.50   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.0   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
@@ -710,6 +711,18 @@ FVG_CANCEL_RANGE_PCT = 0.20   # 20% BOS range dari C3 ujung ke arah BOS → setu
 # (Long) atau low candle fokus (Short). SL = low_engulfing - SL_ENGULF_PCT*bos_rng (Long).
 M5_ENGULF_FILTER  = True    # False = skip filter ini, entry langsung market saat C1 close tersentuh
 SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke besar-kecil BOS)
+
+# --- MODE EKSPERIMENTAL: monitoring M5 semua coin dari awal, tanpa nunggu trigger H1 (BOS/IDM/FVG) ---
+# Independen sepenuhnya dari jalur IDM/FVG di atas — tidak menyentuh state/limit slot mereka.
+# Begitu bot start, SEMUA coin di SYMBOLS langsung mulai cari candle "fokus" M5 (arah manapun,
+# Long & Short dipantau bersamaan) dan mencari engulfing dari situ terus-menerus (fokus geser
+# tiap kali ada candle yang melewati hi/lo fokus, sama seperti aturan dasar _scan_engulf biasa).
+# TIDAK ADA gate EMA H1, TIDAK ADA cross-check IDM/FVG, TIDAK ADA BOS besar sama sekali — market
+# order langsung begitu syarat di bawah terpenuhi.
+EXPERIMENTAL_MODE     = False   # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
+EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
+EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
+EXPERIMENTAL_SL_PCT   = 0.0     # 0 = SL langsung di ujung candle sebelum engulfing (tanpa buffer tambahan)
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2730,6 +2743,179 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
     return _scan_engulf(focus_idx, focus_hi, focus_lo)
 
 
+def check_experimental_engulf(coin, df_m5):
+    """MODE EKSPERIMENTAL — independen sepenuhnya dari jalur IDM/FVG (tidak ada BOS H1, tidak ada
+    gate EMA H1, tidak ada cross-check). Begitu bot start, tiap coin langsung monitoring M5 dari
+    fokus paling awal yang tersedia, cari engulfing (Long & Short dipantau bersamaan).
+
+    ATURAN (per arah):
+      1. Fokus & pindah fokus & range-base: PERSIS sama seperti _scan_engulf() di check_m5_engulfing
+         (candle fokus geser tiap kali ada candle close yang melewati hi/lo fokus; kalau harga masuk
+         penuh ke dalam range fokus dulu, masuk range_base mode).
+      2. Begitu ada candle yang close melewati fokus (calon engulfing, candle index i):
+         a. Candle SEBELUM engulfing (i-1) wick-nya WAJIB menyentuh EMA20 M5 (low<=ema20<=high) —
+            HANYA candle i-1 yang dicek (beda dari filter M5 biasa yang cek 5 candle sebelum).
+         b. Kalau (a) lolos, entry TIDAK langsung terjadi di sini — mulai "menunggu cross EMA8/EMA20"
+            selama EXPERIMENTAL_EMA8_BARS candle (termasuk candle engulfing itu sendiri sebagai
+            candle ke-1, jadi candle ke-1 s/d ke-(EXPERIMENTAL_EMA8_BARS)). Kalau EMA8 cross EMA20
+            SEARAH engulfing (Long: EMA8 dari <=EMA20 jadi >EMA20; Short: EMA8 dari >=EMA20 jadi
+            <EMA20) di salah satu candle dalam window itu → entry MARKET langsung saat cross terjadi.
+         c. Kalau sampai candle ke-(EXPERIMENTAL_EMA8_BARS) belum ada cross → dibatalkan, fokus pindah
+            ke candle engulfing tsb (seperti penolakan biasa), lanjut cari engulfing berikutnya.
+      3. Entry = MARKET (bukan limit). SL = ujung candle SEBELUM engulfing (i-1) ± EXPERIMENTAL_SL_PCT
+         (default 0%, jadi persis high/low candle i-1, TANPA buffer tambahan — beda dari SL_ENGULF_PCT
+         jalur IDM/FVG yang berbasis % range BOS besar, karena di sini TIDAK ADA BOS besar sama sekali).
+
+    State disimpan di experimental_pending[coin]:
+      'm5_focus_hi'/'m5_focus_lo'/'m5_focus_idx' : fokus aktif SAAT INI (dipakai utk SEMUA arah —
+          begitu salah satu arah entry atau salah satu candle jadi fokus baru, brlaku utk keduanya,
+          sama seperti pola pending FVG asli yang scan 1 arah tapi index waktu sama utk semua coin).
+      'range_base' : bool — status range-base mode aktif tidaknya.
+      'ema8_wait'  : dict atau None — kalau sedang menunggu cross EMA8/EMA20 setelah lolos syarat (2a):
+          {'stype': 'Long'/'Short', 'engulf_idx': int, 'prev_hi': float, 'prev_lo': float,
+           'bars_left': int, 'entry_p': float, 'sl_p': float}
+    """
+    global experimental_pending
+    if df_m5 is None or len(df_m5) < 10:
+        return
+    df_m5 = df_m5.copy()
+    df_m5['ema8']  = df_m5['close'].ewm(span=8,  adjust=False).mean()
+    df_m5['ema20'] = df_m5['close'].ewm(span=20, adjust=False).mean()
+    n = len(df_m5)
+    closed_end = n - 1   # exclude candle yang masih berjalan
+
+    st = experimental_pending.get(coin)
+    if st is None:
+        # Inisialisasi pertama kali: fokus = candle paling awal yang tersedia (candle ke-0)
+        st = {
+            'm5_focus_hi': float(df_m5['high'].iloc[0]),
+            'm5_focus_lo': float(df_m5['low'].iloc[0]),
+            'm5_focus_idx': 0,
+            'range_base': False,
+            'ema8_wait': None,
+        }
+        experimental_pending[coin] = st
+        print(f"👁️  EXPERIMENTAL {coin}: mulai monitoring M5 dari fokus awal "
+              f"(hi={st['m5_focus_hi']:.6g} lo={st['m5_focus_lo']:.6g})")
+
+    # ── Kalau sedang menunggu cross EMA8/EMA20 (fase 2b/2c) ──
+    ew = st.get('ema8_wait')
+    if ew is not None:
+        start_i = ew['engulf_idx']   # candle engulfing = candle ke-1 di window tunggu
+        # Cek candle2 baru yang belum diperiksa (dari candle terakhir yg sudah dicek s/d closed_end)
+        last_checked = ew.get('last_checked_idx', start_i - 1)
+        for i in range(last_checked + 1, closed_end):
+            bar_no = i - start_i + 1   # candle engulfing sendiri = bar_no 1
+            if bar_no > EXPERIMENTAL_EMA8_BARS:
+                break
+            ema8_i  = float(df_m5['ema8'].iloc[i])
+            ema20_i = float(df_m5['ema20'].iloc[i])
+            ema8_prev  = float(df_m5['ema8'].iloc[i-1])
+            ema20_prev = float(df_m5['ema20'].iloc[i-1])
+            crossed = False
+            if ew['stype'] == 'Long' and ema8_prev <= ema20_prev and ema8_i > ema20_i:
+                crossed = True
+            elif ew['stype'] == 'Short' and ema8_prev >= ema20_prev and ema8_i < ema20_i:
+                crossed = True
+            if crossed:
+                curr_price = float(df_m5['close'].iloc[i])
+                side = 'Buy' if ew['stype'] == 'Long' else 'Sell'
+                print(f"✅ EXPERIMENTAL {coin} {ew['stype']}: EMA8 cross EMA20 @ candle ke-{bar_no} "
+                      f"({_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i}) → MARKET ENTRY")
+                log_entry(f"════ EXPERIMENTAL MARKET {ew['stype']} {coin} — EMA8 cross EMA20 "
+                          f"(candle ke-{bar_no}/{EXPERIMENTAL_EMA8_BARS}) ════\n"
+                          f"  entry~{curr_price:.6g} SL={ew['sl_p']:.6g}")
+                oid, qty = place_market_entry(coin, side, curr_price, ew['sl_p'], 0)
+                if oid:
+                    dist = abs(curr_price - ew['sl_p'])
+                    active_positions[_akey(coin, ew['stype'])] = {
+                        'coin': coin, 'side': side, 'entry': curr_price, 'sl': ew['sl_p'],
+                        'dist': dist, 'trail_dist': TRAIL_STOP * dist,
+                        'trail_engaged': False, 'trail_set': False,
+                        'last_price': curr_price, 'entry_time': time.time(),
+                        'peak': curr_price, 'peak_time': time.time(),
+                        'bos_type': ew['stype'], 'rev_count': 0,
+                        'orig_ocl': curr_price, 'kind': 'experimental',
+                    }
+                # Fokus baru = candle engulfing yang barusan dipakai (sama seperti pola pindah fokus)
+                st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
+                st['m5_focus_idx'] = start_i
+                st['ema8_wait'] = None
+                return
+        # Belum cross sampai batas window → cek apakah window sudah habis
+        last_bar_no = (closed_end - 1) - start_i + 1
+        if last_bar_no >= EXPERIMENTAL_EMA8_BARS:
+            print(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
+                  f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
+            st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
+            st['m5_focus_idx'] = start_i
+            st['ema8_wait'] = None
+        else:
+            st['ema8_wait']['last_checked_idx'] = closed_end - 1
+        return   # entry belum terjadi (nunggu cross ATAU baru saja dibatalkan) — scan fokus baru mulai siklus berikutnya
+
+    # ── Scan fokus normal (belum ada calon engulfing yang lolos EMA-prev) ──
+    focus_idx = st['m5_focus_idx']
+    f_hi = st['m5_focus_hi']; f_lo = st['m5_focus_lo']
+    range_base = st.get('range_base', False)
+    for i in range(focus_idx + 1, closed_end):
+        lo = float(df_m5['low'].iloc[i]); hi = float(df_m5['high'].iloc[i])
+        cl = float(df_m5['close'].iloc[i])
+
+        if not range_base and hi < f_hi and lo > f_lo:
+            range_base = True
+            log_entry(f"   EXPERIMENTAL {coin}: range base mode aktif @ "
+                      f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                      f"(candle base hi={f_hi:.6g} lo={f_lo:.6g})")
+
+        long_sweep_opp  = (lo <= f_lo)
+        short_sweep_opp = (hi >= f_hi)
+        prev_hi = float(df_m5['high'].iloc[i-1]); prev_lo = float(df_m5['low'].iloc[i-1])
+
+        engulf_long  = cl > f_hi and not long_sweep_opp  and not range_base
+        engulf_short = cl < f_lo and not short_sweep_opp and not range_base
+        if engulf_long or engulf_short:
+            estype = 'Long' if engulf_long else 'Short'
+            ema_prev = float(df_m5['ema20'].iloc[i-1])
+            prev_ok = (EXPERIMENTAL_EMA_PREV is False) or (prev_lo <= ema_prev <= prev_hi)
+            if not prev_ok:
+                log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
+                          f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                          f"DITOLAK (candle sebelum engulfing tak sentuh EMA20)")
+                f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
+                continue
+            # Lolos syarat EMA-prev → mulai tunggu cross EMA8/EMA20
+            entry_p = prev_hi if estype == 'Long' else prev_lo
+            sl_buf  = EXPERIMENTAL_SL_PCT * abs(prev_hi - prev_lo)
+            sl_p    = (prev_lo - sl_buf) if estype == 'Long' else (prev_hi + sl_buf)
+            print(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
+                  f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
+                  f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
+                  f"entry~{entry_p:.6g} SL={sl_p:.6g}")
+            st['ema8_wait'] = {
+                'stype': estype, 'engulf_idx': i, 'prev_hi': prev_hi, 'prev_lo': prev_lo,
+                'entry_p': entry_p, 'sl_p': sl_p, 'last_checked_idx': i - 1,
+            }
+            st['m5_focus_idx'] = focus_idx; st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
+            st['range_base'] = range_base
+            return
+
+        # Update fokus (aturan dasar sama seperti _scan_engulf biasa)
+        if range_base:
+            if hi < f_hi and lo > f_lo:
+                pass
+            elif (long_sweep_opp and cl <= f_hi) or (short_sweep_opp and cl >= f_lo):
+                pass
+            else:
+                f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
+        else:
+            if hi > f_hi or lo < f_lo:
+                f_hi = max(f_hi, hi); f_lo = min(f_lo, lo); focus_idx = i
+
+    st['m5_focus_idx'] = focus_idx; st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
+    st['range_base'] = range_base
+
+
 def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
     """Proses 1 setup (1 arah). Mutasi setup in-place.
     Return: 'remove' | 'keep' (WAIT_APPROACH) | 'lock' (WAIT_FILL) | 'fill' (posisi sudah dibuka)."""
@@ -3269,6 +3455,14 @@ def run_bot():
         for coin in SYMBOLS:
             try:
                 time.sleep(3)
+
+                # ── MODE EKSPERIMENTAL: independen total dari jalur IDM/FVG di bawah ──
+                if EXPERIMENTAL_MODE:
+                    if ALLOW_HEDGE or coin not in active_positions:
+                        df_m5_exp = get_data(coin, "5", limit=300)
+                        check_experimental_engulf(coin, df_m5_exp)
+                    continue
+
                 # Funding window: batalkan limit yg gak searah sebelum settlement
                 if FUNDING_FILTER and in_funding_window():
                     cancel_unfavorable_limits(coin)
