@@ -724,6 +724,7 @@ EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick ha
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
 EXPERIMENTAL_SL_PCT   = 0.30    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
 EXPERIMENTAL_NO_CROSS_BARS = 20 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
+EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2891,6 +2892,13 @@ def check_experimental_engulf(coin, df_m5):
             st['ema8_wait'] = None
         else:
             st['ema8_wait']['last_checked_ts'] = float(df_m5['ts'].iloc[closed_end - 1])
+            # Log status periodik supaya jelas bot masih hidup selama menunggu cross (tidak ada
+            # event lain yang bikin log muncul selama fase ini bisa berlangsung s/d 5 candle).
+            wait_cycles = ew.get('wait_cycles', 0) + 1
+            st['ema8_wait']['wait_cycles'] = wait_cycles
+            if wait_cycles % EXPERIMENTAL_IDLE_LOG_EVERY == 0:
+                log_entry(f"⏳ EXPERIMENTAL {coin} {ew['stype']}: masih menunggu EMA8 cross EMA20 "
+                          f"(candle ke-{last_bar_no}/{EXPERIMENTAL_EMA8_BARS}, sudah {wait_cycles} siklus)")
         return   # entry belum terjadi (nunggu cross ATAU baru saja dibatalkan) — scan fokus baru mulai siklus berikutnya
 
     # ── Scan fokus normal (belum ada calon engulfing yang lolos EMA-prev) ──
@@ -2906,6 +2914,7 @@ def check_experimental_engulf(coin, df_m5):
         log_entry(f"⚠️ EXPERIMENTAL {coin}: fokus lama di luar window data — di-reset ke candle live terakhir")
     f_hi = st['m5_focus_hi']; f_lo = st['m5_focus_lo']
     range_base = st.get('range_base', False)
+    _focus_idx_before = focus_idx   # dipakai di akhir utk deteksi "tidak ada event sama sekali"
     for i in range(focus_idx + 1, closed_end):
         lo = float(df_m5['low'].iloc[i]); hi = float(df_m5['high'].iloc[i])
         cl = float(df_m5['close'].iloc[i])
@@ -2990,6 +2999,19 @@ def check_experimental_engulf(coin, df_m5):
 
     st['m5_focus_ts'] = float(df_m5['ts'].iloc[focus_idx]); st['m5_focus_hi'] = f_hi; st['m5_focus_lo'] = f_lo
     st['range_base'] = range_base
+
+    # Log status periodik kalau TIDAK ADA event apapun (fokus tidak pindah sama sekali) di
+    # pemanggilan ini — supaya jelas bot masih hidup meski market lagi sideways/diam lama (mis.
+    # range_base aktif terus-menerus tanpa breakout).
+    if focus_idx == _focus_idx_before:
+        idle_cycles = st.get('idle_cycles', 0) + 1
+        st['idle_cycles'] = idle_cycles
+        if idle_cycles % EXPERIMENTAL_IDLE_LOG_EVERY == 0:
+            _mode = "range_base" if range_base else "normal"
+            log_entry(f"⏳ EXPERIMENTAL {coin}: masih diam (mode={_mode}, fokus hi={f_hi:.6g} "
+                      f"lo={f_lo:.6g}, sudah {idle_cycles} siklus tanpa event)")
+    else:
+        st['idle_cycles'] = 0
 
 
 def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
