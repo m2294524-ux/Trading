@@ -277,7 +277,7 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
 TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 8.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_ACT_R      = 9.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -2877,9 +2877,15 @@ def check_experimental_engulf(coin, df_m5):
                         'bos_type': ew['stype'], 'rev_count': 0,
                         'orig_ocl': curr_price, 'kind': 'experimental',
                     }
-                # Fokus baru = candle engulfing yang barusan dipakai (sama seperti pola pindah fokus)
-                st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
-                st['m5_focus_ts'] = ew['engulf_ts']
+                # Fokus baru = candle CROSS (tempat entry beneran terjadi), BUKAN candle engulfing
+                # (awal window tunggu). Kalau dipakai candle engulfing, scan berikutnya akan
+                # MENGULANG candle-candle di antara engulfing dan cross (yang bisa beberapa candle
+                # kalau cross-nya baru terjadi di bar ke-2/3/dst) — dan bisa MENEMUKAN LAGI pola
+                # engulfing yang sama persis, memicu ema8_wait baru & entry KEDUA untuk struktur yang
+                # identik. Dengan fokus di candle cross, scan berikutnya mulai dari candle SETELAH
+                # cross — tidak pernah menoleh balik ke candle yang sudah dipakai entry.
+                st['m5_focus_hi'] = float(df_m5['high'].iloc[i]); st['m5_focus_lo'] = float(df_m5['low'].iloc[i])
+                st['m5_focus_ts'] = float(df_m5['ts'].iloc[i])
                 st['ema8_wait'] = None
                 return
         # Belum cross sampai batas window → cek apakah window sudah habis
@@ -2887,8 +2893,12 @@ def check_experimental_engulf(coin, df_m5):
         if last_bar_no >= EXPERIMENTAL_EMA8_BARS:
             log_entry(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
                       f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
-            st['m5_focus_hi'] = ew['prev_hi']; st['m5_focus_lo'] = ew['prev_lo']
-            st['m5_focus_ts'] = ew['engulf_ts']
+            # Fokus ke candle TERAKHIR yang sudah diperiksa dalam window tunggu (bukan candle
+            # engulfing awal) — supaya konsisten dgn fix di atas, scan berikutnya tidak menoleh
+            # balik ke candle2 yang sudah pernah diperiksa selama fase tunggu.
+            last_i = min(start_i + EXPERIMENTAL_EMA8_BARS - 1, closed_end - 1)
+            st['m5_focus_hi'] = float(df_m5['high'].iloc[last_i]); st['m5_focus_lo'] = float(df_m5['low'].iloc[last_i])
+            st['m5_focus_ts'] = float(df_m5['ts'].iloc[last_i])
             st['ema8_wait'] = None
         else:
             st['ema8_wait']['last_checked_ts'] = float(df_m5['ts'].iloc[closed_end - 1])
@@ -2963,10 +2973,6 @@ def check_experimental_engulf(coin, df_m5):
             # random tergantung besar candle; sekarang selalu proporsional EXPERIMENTAL_SL_PCT dari
             # harga entry beneran).
             entry_p_est = prev_hi if estype == 'Long' else prev_lo   # cuma estimasi utk log, bukan SL final
-            print(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
-                  f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
-                  f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
-                  f"entry~{entry_p_est:.6g}")
             log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
                       f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
                       f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
