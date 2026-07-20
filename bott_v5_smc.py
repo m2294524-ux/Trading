@@ -2982,17 +2982,17 @@ def check_experimental_engulf(coin, df_m5):
         # Update fokus (aturan dasar sama seperti _scan_engulf biasa)
         if range_base:
             if hi < f_hi and lo > f_lo:
-                pass
-            elif (long_sweep_opp and cl <= f_hi) or (short_sweep_opp and cl >= f_lo):
-                pass
+                pass   # candle masih sepenuhnya di dalam rentang fokus — tetap diam
             else:
+                # Sweep salah satu sisi (low<=f_lo atau high>=f_hi) → LANGSUNG pindah fokus ke
+                # candle ini, apapun posisi close-nya (tidak perlu break/close tembus lagi).
                 f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
                 log_entry(f"   EXPERIMENTAL {coin}: fokus pindah ke M5 "
                           f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                          f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
+                          f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g} (sweep dari range_base)")
         else:
             if hi > f_hi or lo < f_lo:
-                f_hi = max(f_hi, hi); f_lo = min(f_lo, lo); focus_idx = i
+                f_hi = hi; f_lo = lo; focus_idx = i
                 log_entry(f"   EXPERIMENTAL {coin}: fokus pindah ke M5 "
                           f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
                           f"hi={hi:.6g} lo={lo:.6g} close={cl:.6g}")
