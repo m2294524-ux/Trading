@@ -277,7 +277,7 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
 TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 9.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_ACT_R      = 6.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -723,7 +723,7 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 EXPERIMENTAL_MODE     = True    # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
-EXPERIMENTAL_SL_PCT   = 0.10    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
+EXPERIMENTAL_SL_PCT   = 0.15    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
 EXPERIMENTAL_NO_CROSS_BARS = 3 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
 
@@ -2786,14 +2786,22 @@ def update_h1_bias(coin, df_h1):
     st = h1_bias_state.get(coin)
     if st is None:
         # Inisialisasi pertama kali (termasuk setelah redeploy) — mulai dari candle H1 closed
-        # TERAKHIR, bias netral. Cross-cross lama di histori TIDAK di-scan sama sekali.
+        # TERAKHIR. Bias awal LANGSUNG diambil dari posisi EMA8 vs EMA20 SAAT INI (bukan nunggu
+        # cross baru dulu) — ini BUKAN "menganggap cross lama sbg trigger baru" (yang dihindari),
+        # melainkan cuma membaca kondisi tren H1 yang sedang berlangsung sekarang: kalau EMA8
+        # sedang di ATAS EMA20 -> bias Long (tetap Long selama EMA8 belum cross balik ke bawah);
+        # kalau di BAWAH -> bias Short. Cross histori itu sendiri TIDAK di-scan/di-log sama sekali,
+        # hanya cross yang terjadi live setelah titik ini yang akan mengubah bias selanjutnya.
         last_idx = closed_end - 1
         if last_idx < 1:
             return   # data H1 belum cukup, tunggu siklus berikutnya
-        st = {'last_ts': float(df['ts'].iloc[last_idx]), 'bias': None}
+        e8_0, e20_0 = float(df['ema8'].iloc[last_idx]), float(df['ema20'].iloc[last_idx])
+        init_bias = 'Long' if e8_0 > e20_0 else ('Short' if e8_0 < e20_0 else None)
+        st = {'last_ts': float(df['ts'].iloc[last_idx]), 'bias': init_bias}
         h1_bias_state[coin] = st
         log_entry(f"👁️  H1 BIAS {coin}: mulai monitoring EMA8/EMA20 H1 dari candle live terakhir "
-                  f"({_ts_wib(df['ts'].iloc[last_idx])}) — cross lama diabaikan, bias awal netral")
+                  f"({_ts_wib(df['ts'].iloc[last_idx])}) — bias awal = {init_bias or 'netral (EMA8≈EMA20)'} "
+                  f"(EMA8={e8_0:.6g}, EMA20={e20_0:.6g})")
         return
 
     last_i = _idx_of_ts(st['last_ts'])
