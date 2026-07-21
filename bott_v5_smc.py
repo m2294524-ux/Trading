@@ -276,8 +276,8 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 6.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_ACT_R      = 4.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -430,7 +430,7 @@ idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
 experimental_pending = {}   # coin -> {'m5_focus_hi','m5_focus_lo','m5_focus_ts', ...} — state mode eksperimental (berbasis TIMESTAMP, bukan index; independen dari pending/idm_pending)
-h1_bias_state    = {}   # coin -> {'last_ts': <ts candle H1 closed terakhir yg sudah diproses>, 'bias': 'Long'/'Short'/None} — patokan arah entry M5 dari cross EMA8/EMA20 H1
+h1_bias_state    = {}   # coin -> {'last_ts': <ts candle H1 closed terakhir yg sudah diproses>, 'bias': 'Long'/'Short'/None} — patokan arah entry M5 dari cross EMA3/EMA20 H1
 
 def _bos_match(swing_val, choch_level, swing_val2, choch_level2):
     """True kalau dua BOS besar SAMA PERSIS (dipakai cross-check IDM vs FVG di bawah)."""
@@ -722,14 +722,13 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 # order langsung begitu syarat di bawah terpenuhi.
 EXPERIMENTAL_MODE     = True    # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
-EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
+EXPERIMENTAL_EMA_CROSS_BARS = 5      # window candle (SEBELUM & SESUDAH engulfing) utk cari cross EMA3/EMA20
 EXPERIMENTAL_SL_PCT   = 0.15    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
-EXPERIMENTAL_NO_CROSS_BARS = 3 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
 
-# --- FILTER BIAS H1 (EMA8/EMA20) untuk arah entry M5 mode eksperimental ---
-# H1 dipakai sbg "patokan arah": EMA8 cross EMA20 dari BAWAH ke ATAS di H1 -> bias = Long (hanya
-# cari entry Long di M5). Beberapa candle H1 kemudian, kalau EMA8 cross balik ke BAWAH EMA20 ->
+# --- FILTER BIAS H1 (EMA3/EMA20) untuk arah entry M5 mode eksperimental ---
+# H1 dipakai sbg "patokan arah": EMA3 cross EMA20 dari BAWAH ke ATAS di H1 -> bias = Long (hanya
+# cari entry Long di M5). Beberapa candle H1 kemudian, kalau EMA3 cross balik ke BAWAH EMA20 ->
 # bias berganti jadi Short (hanya cari entry Short di M5). Bias tetap berlaku sampai ada cross
 # H1 berlawanan berikutnya (tidak reset tiap candle). Tujuannya mengurangi over-trading krn noise
 # M5 dengan memaksa entry searah tren H1 saja.
@@ -2755,9 +2754,9 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
 
 
 def update_h1_bias(coin, df_h1):
-    """Tentukan/perbarui bias arah entry M5 (mode eksperimental) dari cross EMA8/EMA20 di H1.
-      - EMA8 cross EMA20 dari BAWAH ke ATAS  -> bias = 'Long'  (mode eksperimental hanya cari Long di M5)
-      - EMA8 cross EMA20 dari ATAS ke BAWAH  -> bias = 'Short' (mode eksperimental hanya cari Short di M5)
+    """Tentukan/perbarui bias arah entry M5 (mode eksperimental) dari cross EMA3/EMA20 di H1.
+      - EMA3 cross EMA20 dari BAWAH ke ATAS  -> bias = 'Long'  (mode eksperimental hanya cari Long di M5)
+      - EMA3 cross EMA20 dari ATAS ke BAWAH  -> bias = 'Short' (mode eksperimental hanya cari Short di M5)
     Bias TETAP di arah terakhir sampai ada cross H1 berlawanan berikutnya (bukan sinyal sekali pakai).
 
     PENTING (anti-bug redeploy) — sama persis pola timestamp yang dipakai check_experimental_engulf:
@@ -2774,7 +2773,7 @@ def update_h1_bias(coin, df_h1):
     if df_h1 is None or len(df_h1) < 25 or 'ts' not in df_h1.columns:
         return
     df = df_h1.copy().reset_index(drop=True)
-    df['ema8']  = df['close'].ewm(span=8,  adjust=False).mean()
+    df['ema3']  = df['close'].ewm(span=3,  adjust=False).mean()
     df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
     n = len(df)
     closed_end = n - 1   # exclude candle H1 yang masih berjalan (belum closed)
@@ -2786,22 +2785,22 @@ def update_h1_bias(coin, df_h1):
     st = h1_bias_state.get(coin)
     if st is None:
         # Inisialisasi pertama kali (termasuk setelah redeploy) — mulai dari candle H1 closed
-        # TERAKHIR. Bias awal LANGSUNG diambil dari posisi EMA8 vs EMA20 SAAT INI (bukan nunggu
+        # TERAKHIR. Bias awal LANGSUNG diambil dari posisi EMA3 vs EMA20 SAAT INI (bukan nunggu
         # cross baru dulu) — ini BUKAN "menganggap cross lama sbg trigger baru" (yang dihindari),
-        # melainkan cuma membaca kondisi tren H1 yang sedang berlangsung sekarang: kalau EMA8
-        # sedang di ATAS EMA20 -> bias Long (tetap Long selama EMA8 belum cross balik ke bawah);
+        # melainkan cuma membaca kondisi tren H1 yang sedang berlangsung sekarang: kalau EMA3
+        # sedang di ATAS EMA20 -> bias Long (tetap Long selama EMA3 belum cross balik ke bawah);
         # kalau di BAWAH -> bias Short. Cross histori itu sendiri TIDAK di-scan/di-log sama sekali,
         # hanya cross yang terjadi live setelah titik ini yang akan mengubah bias selanjutnya.
         last_idx = closed_end - 1
         if last_idx < 1:
             return   # data H1 belum cukup, tunggu siklus berikutnya
-        e8_0, e20_0 = float(df['ema8'].iloc[last_idx]), float(df['ema20'].iloc[last_idx])
-        init_bias = 'Long' if e8_0 > e20_0 else ('Short' if e8_0 < e20_0 else None)
+        e3_0, e20_0 = float(df['ema3'].iloc[last_idx]), float(df['ema20'].iloc[last_idx])
+        init_bias = 'Long' if e3_0 > e20_0 else ('Short' if e3_0 < e20_0 else None)
         st = {'last_ts': float(df['ts'].iloc[last_idx]), 'bias': init_bias}
         h1_bias_state[coin] = st
-        log_entry(f"👁️  H1 BIAS {coin}: mulai monitoring EMA8/EMA20 H1 dari candle live terakhir "
-                  f"({_ts_wib(df['ts'].iloc[last_idx])}) — bias awal = {init_bias or 'netral (EMA8≈EMA20)'} "
-                  f"(EMA8={e8_0:.6g}, EMA20={e20_0:.6g})")
+        log_entry(f"👁️  H1 BIAS {coin}: mulai monitoring EMA3/EMA20 H1 dari candle live terakhir "
+                  f"({_ts_wib(df['ts'].iloc[last_idx])}) — bias awal = {init_bias or 'netral (EMA3≈EMA20)'} "
+                  f"(EMA3={e3_0:.6g}, EMA20={e20_0:.6g})")
         return
 
     last_i = _idx_of_ts(st['last_ts'])
@@ -2817,19 +2816,47 @@ def update_h1_bias(coin, df_h1):
         return
 
     for i in range(last_i + 1, closed_end):
-        e8, e20   = float(df['ema8'].iloc[i]),   float(df['ema20'].iloc[i])
-        e8p, e20p = float(df['ema8'].iloc[i-1]), float(df['ema20'].iloc[i-1])
-        if e8p <= e20p and e8 > e20:
+        e3, e20   = float(df['ema3'].iloc[i]),   float(df['ema20'].iloc[i])
+        e3p, e20p = float(df['ema3'].iloc[i-1]), float(df['ema20'].iloc[i-1])
+        if e3p <= e20p and e3 > e20:
             st['bias'] = 'Long'
-            log_entry(f"🔀 H1 BIAS {coin}: EMA8 cross EMA20 ke ATAS @ {_ts_wib(df['ts'].iloc[i])} "
-                      f"(EMA8={e8:.6g} > EMA20={e20:.6g}) → bias entry M5 = LONG")
-        elif e8p >= e20p and e8 < e20:
+            log_entry(f"🔀 H1 BIAS {coin}: EMA3 cross EMA20 ke ATAS @ {_ts_wib(df['ts'].iloc[i])} "
+                      f"(EMA3={e3:.6g} > EMA20={e20:.6g}) → bias entry M5 = LONG")
+        elif e3p >= e20p and e3 < e20:
             st['bias'] = 'Short'
-            log_entry(f"🔀 H1 BIAS {coin}: EMA8 cross EMA20 ke BAWAH @ {_ts_wib(df['ts'].iloc[i])} "
-                      f"(EMA8={e8:.6g} < EMA20={e20:.6g}) → bias entry M5 = SHORT")
+            log_entry(f"🔀 H1 BIAS {coin}: EMA3 cross EMA20 ke BAWAH @ {_ts_wib(df['ts'].iloc[i])} "
+                      f"(EMA3={e3:.6g} < EMA20={e20:.6g}) → bias entry M5 = SHORT")
 
     if closed_end - 1 >= 0:
         st['last_ts'] = float(df['ts'].iloc[closed_end - 1])
+
+
+def _experimental_execute_entry(coin, stype, df_m5, entry_i, note=""):
+    """Eksekusi MARKET entry mode eksperimental — dipakai baik saat cross EMA3/EMA20 ditemukan di
+    window SEBELUM engulfing maupun SESUDAH engulfing (logikanya identik, cuma titik entry beda).
+    entry_i = index candle df_m5 tempat entry terjadi (harga = close candle itu).
+    SL = entry AKTUAL ± EXPERIMENTAL_SL_PCT% dari harga entry sebenarnya (bukan dari ujung candle).
+    """
+    curr_price = float(df_m5['close'].iloc[entry_i])
+    side = 'Buy' if stype == 'Long' else 'Sell'
+    sl_buf = curr_price * (EXPERIMENTAL_SL_PCT / 100.0)
+    sl_p = (curr_price - sl_buf) if stype == 'Long' else (curr_price + sl_buf)
+    print(f"✅ EXPERIMENTAL {coin} {stype}: EMA3 cross EMA20 {note} → MARKET ENTRY")
+    log_entry(f"════ EXPERIMENTAL MARKET {stype} {coin} — EMA3 cross EMA20 {note} ════\n"
+              f"  entry~{curr_price:.6g} SL={sl_p:.6g} ({EXPERIMENTAL_SL_PCT:.2f}% dari entry)")
+    oid, qty = place_market_entry(coin, side, curr_price, sl_p, 0)
+    if oid:
+        dist = abs(curr_price - sl_p)
+        active_positions[_akey(coin, stype)] = {
+            'coin': coin, 'side': side, 'entry': curr_price, 'sl': sl_p,
+            'dist': dist, 'trail_dist': TRAIL_STOP * dist,
+            'trail_engaged': False, 'trail_set': False,
+            'last_price': curr_price, 'entry_time': time.time(),
+            'peak': curr_price, 'peak_time': time.time(),
+            'bos_type': stype, 'rev_count': 0,
+            'orig_ocl': curr_price, 'kind': 'experimental',
+        }
+    return oid
 
 
 def check_experimental_engulf(coin, df_m5):
@@ -2852,25 +2879,29 @@ def check_experimental_engulf(coin, df_m5):
       2. Begitu ada candle yang close melewati fokus (calon engulfing, candle index i):
          a. Candle SEBELUM engulfing (i-1) wick-nya WAJIB menyentuh EMA20 M5 (low<=ema20<=high) —
             HANYA candle i-1 yang dicek (beda dari filter M5 biasa yang cek 5 candle sebelum).
-         a2. TIDAK boleh ada EMA8/EMA20 cross (arah manapun) di EXPERIMENTAL_NO_CROSS_BARS candle
-            SEBELUM engulfing (i-N..i-1, default N=20) — memastikan tren sudah stabil dulu sebelum
-            candle engulfing terbentuk (bukan baru saja whipsaw/choppy).
-         b. Kalau (a) dan (a2) lolos, entry TIDAK langsung terjadi di sini — mulai "menunggu cross
-            EMA8/EMA20" selama EXPERIMENTAL_EMA8_BARS candle (termasuk candle engulfing itu sendiri
-            sebagai candle ke-1, jadi candle ke-1 s/d ke-(EXPERIMENTAL_EMA8_BARS)). Kalau EMA8 cross
-            EMA20 SEARAH engulfing (Long: EMA8 dari <=EMA20 jadi >EMA20; Short: EMA8 dari >=EMA20
-            jadi <EMA20) di salah satu candle dalam window itu → entry MARKET langsung saat cross.
-         c. Kalau sampai candle ke-(EXPERIMENTAL_EMA8_BARS) belum ada cross → dibatalkan, fokus pindah
-            ke candle engulfing tsb (seperti penolakan biasa), lanjut cari engulfing berikutnya.
-      3. Entry = MARKET (bukan limit). SL = harga entry AKTUAL (saat cross terjadi) ± EXPERIMENTAL_SL_PCT%
-         dari entry — dihitung ulang di titik entry sebenarnya, BUKAN dari ujung candle sebelum
-         engulfing (itu bisa lebar/sempit random tergantung besar candle; sekarang selalu proporsional
-         & konsisten terhadap harga, sesuai permintaan user).
+         b. Kalau (a) lolos, cek cross EMA3/EMA20 SEARAH engulfing (Long: EMA3 dari <=EMA20 jadi
+            >EMA20; Short: EMA3 dari >=EMA20 jadi <EMA20) di window EXPERIMENTAL_EMA_CROSS_BARS
+            candle SEBELUM engulfing (i-N..i-1). Kalau KETEMU → cross itu dianggap valid, entry
+            MARKET langsung terjadi SAAT INI (candle engulfing i, harga = close candle i) — tidak
+            perlu nunggu candle berikutnya lagi karena EMA sudah cross duluan sebelum engulfing
+            terbentuk.
+         c. Kalau TIDAK ketemu di (b), mulai "menunggu cross EMA3/EMA20" ke DEPAN selama
+            EXPERIMENTAL_EMA_CROSS_BARS candle (termasuk candle engulfing itu sendiri sebagai
+            candle ke-1, jadi candle ke-1 s/d ke-(EXPERIMENTAL_EMA_CROSS_BARS)). Begitu cross
+            searah terjadi di salah satu candle dalam window itu → entry MARKET saat itu juga.
+         d. Kalau sampai candle ke-(EXPERIMENTAL_EMA_CROSS_BARS) SESUDAH masih belum ada cross →
+            dibatalkan, fokus pindah ke candle terakhir yang sudah diperiksa, lanjut cari
+            engulfing berikutnya.
+         Jadi total window pencarian cross = i-N (sebelum) s/d i+N-1 (sesudah), N=EXPERIMENTAL_EMA_CROSS_BARS.
+      3. Entry = MARKET (bukan limit). SL = harga entry AKTUAL (saat/di titik cross ditemukan) ±
+         EXPERIMENTAL_SL_PCT% dari entry — dihitung ulang di titik entry sebenarnya, BUKAN dari
+         ujung candle sebelum engulfing (itu bisa lebar/sempit random tergantung besar candle;
+         sekarang selalu proporsional & konsisten terhadap harga, sesuai permintaan user).
 
     State disimpan di experimental_pending[coin] (SEMUA berbasis TIMESTAMP, bukan index):
       'm5_focus_ts'/'m5_focus_hi'/'m5_focus_lo' : fokus aktif SAAT INI.
       'range_base' : bool — status range-base mode aktif tidaknya.
-      'ema8_wait'  : dict atau None — kalau sedang menunggu cross EMA8/EMA20 setelah lolos syarat (2a):
+      'ema_wait'  : dict atau None — kalau sedang menunggu cross EMA3/EMA20 setelah lolos syarat (2a):
           {'stype': 'Long'/'Short', 'engulf_ts': float, 'prev_hi': float, 'prev_lo': float,
            'entry_p': float, 'sl_p': float, 'last_checked_ts': float}
     """
@@ -2878,7 +2909,7 @@ def check_experimental_engulf(coin, df_m5):
     if df_m5 is None or len(df_m5) < 10 or 'ts' not in df_m5.columns:
         return
     df_m5 = df_m5.copy().reset_index(drop=True)
-    df_m5['ema8']  = df_m5['close'].ewm(span=8,  adjust=False).mean()
+    df_m5['ema3']  = df_m5['close'].ewm(span=3,  adjust=False).mean()
     df_m5['ema20'] = df_m5['close'].ewm(span=20, adjust=False).mean()
     n = len(df_m5)
     closed_end = n - 1   # exclude candle yang masih berjalan
@@ -2903,7 +2934,7 @@ def check_experimental_engulf(coin, df_m5):
             'm5_focus_hi': float(df_m5['high'].iloc[last_idx]),
             'm5_focus_lo': float(df_m5['low'].iloc[last_idx]),
             'range_base': False,
-            'ema8_wait': None,
+            'ema_wait': None,
         }
         experimental_pending[coin] = st
         print(f"👁️  EXPERIMENTAL {coin}: mulai monitoring M5 dari candle live terakhir "
@@ -2911,8 +2942,8 @@ def check_experimental_engulf(coin, df_m5):
               f"hi={st['m5_focus_hi']:.6g} lo={st['m5_focus_lo']:.6g}) — engulfing lama diabaikan")
         return   # baru inisialisasi — scan candle berikutnya mulai siklus berikutnya (data belum ada)
 
-    # ── Kalau sedang menunggu cross EMA8/EMA20 (fase 2b/2c) ──
-    ew = st.get('ema8_wait')
+    # ── Kalau sedang menunggu cross EMA3/EMA20 (fase 2b/2c) ──
+    ew = st.get('ema_wait')
     if ew is not None:
         start_i = _idx_of_ts(ew['engulf_ts'])
         if start_i is None:
@@ -2920,7 +2951,7 @@ def check_experimental_engulf(coin, df_m5):
             # candle = ~25 jam data M5) — batalkan wait, mulai scan fokus dari awal window baru.
             log_entry(f"⚠️ EXPERIMENTAL {coin} {ew['stype']}: candle engulfing acuan sudah di luar "
                       f"window data — wait dibatalkan")
-            st['ema8_wait'] = None
+            st['ema_wait'] = None
             return
         last_checked_ts = ew.get('last_checked_ts')
         last_checked_i = _idx_of_ts(last_checked_ts) if last_checked_ts is not None else start_i - 1
@@ -2928,76 +2959,55 @@ def check_experimental_engulf(coin, df_m5):
             last_checked_i = start_i - 1
         for i in range(last_checked_i + 1, closed_end):
             bar_no = i - start_i + 1   # candle engulfing sendiri = bar_no 1
-            if bar_no > EXPERIMENTAL_EMA8_BARS:
+            if bar_no > EXPERIMENTAL_EMA_CROSS_BARS:
                 break
-            ema8_i  = float(df_m5['ema8'].iloc[i])
+            ema3_i  = float(df_m5['ema3'].iloc[i])
             ema20_i = float(df_m5['ema20'].iloc[i])
-            ema8_prev  = float(df_m5['ema8'].iloc[i-1])
+            ema3_prev  = float(df_m5['ema3'].iloc[i-1])
             ema20_prev = float(df_m5['ema20'].iloc[i-1])
             crossed = False
-            # "Cross" = EMA8 menyentuh/sama dengan EMA20 (>=/<=), TIDAK perlu benar2 melewati (>/<)
+            # "Cross" = EMA3 menyentuh/sama dengan EMA20 (>=/<=), TIDAK perlu benar2 melewati (>/<)
             # — cukup bersinggungan dari sisi yang berlawanan di candle sebelumnya.
-            if ew['stype'] == 'Long' and ema8_prev < ema20_prev and ema8_i >= ema20_i:
+            if ew['stype'] == 'Long' and ema3_prev < ema20_prev and ema3_i >= ema20_i:
                 crossed = True
-            elif ew['stype'] == 'Short' and ema8_prev > ema20_prev and ema8_i <= ema20_i:
+            elif ew['stype'] == 'Short' and ema3_prev > ema20_prev and ema3_i <= ema20_i:
                 crossed = True
             if crossed:
-                curr_price = float(df_m5['close'].iloc[i])
-                side = 'Buy' if ew['stype'] == 'Long' else 'Sell'
-                # SL = entry AKTUAL ± EXPERIMENTAL_SL_PCT% (dihitung dari harga entry sebenarnya saat
-                # cross terjadi, BUKAN dari ujung candle sebelum engulfing — supaya jarak SL selalu
-                # proporsional & konsisten, tidak lebar/sempit random tergantung besar candle).
-                sl_buf = curr_price * (EXPERIMENTAL_SL_PCT / 100.0)
-                sl_p = (curr_price - sl_buf) if ew['stype'] == 'Long' else (curr_price + sl_buf)
-                print(f"✅ EXPERIMENTAL {coin} {ew['stype']}: EMA8 cross EMA20 @ candle ke-{bar_no} "
-                      f"({_ts_wib(df_m5['ts'].iloc[i])}) → MARKET ENTRY")
-                log_entry(f"════ EXPERIMENTAL MARKET {ew['stype']} {coin} — EMA8 cross EMA20 "
-                          f"(candle ke-{bar_no}/{EXPERIMENTAL_EMA8_BARS}) ════\n"
-                          f"  entry~{curr_price:.6g} SL={sl_p:.6g} ({EXPERIMENTAL_SL_PCT:.2f}% dari entry)")
-                oid, qty = place_market_entry(coin, side, curr_price, sl_p, 0)
-                if oid:
-                    dist = abs(curr_price - sl_p)
-                    active_positions[_akey(coin, ew['stype'])] = {
-                        'coin': coin, 'side': side, 'entry': curr_price, 'sl': sl_p,
-                        'dist': dist, 'trail_dist': TRAIL_STOP * dist,
-                        'trail_engaged': False, 'trail_set': False,
-                        'last_price': curr_price, 'entry_time': time.time(),
-                        'peak': curr_price, 'peak_time': time.time(),
-                        'bos_type': ew['stype'], 'rev_count': 0,
-                        'orig_ocl': curr_price, 'kind': 'experimental',
-                    }
+                note = (f"@ candle ke-{bar_no}/{EXPERIMENTAL_EMA_CROSS_BARS} SESUDAH engulfing "
+                        f"({_ts_wib(df_m5['ts'].iloc[i])})")
+                _experimental_execute_entry(coin, ew['stype'], df_m5, i, note=note)
                 # Fokus baru = candle CROSS (tempat entry beneran terjadi), BUKAN candle engulfing
                 # (awal window tunggu). Kalau dipakai candle engulfing, scan berikutnya akan
                 # MENGULANG candle-candle di antara engulfing dan cross (yang bisa beberapa candle
                 # kalau cross-nya baru terjadi di bar ke-2/3/dst) — dan bisa MENEMUKAN LAGI pola
-                # engulfing yang sama persis, memicu ema8_wait baru & entry KEDUA untuk struktur yang
+                # engulfing yang sama persis, memicu ema_wait baru & entry KEDUA untuk struktur yang
                 # identik. Dengan fokus di candle cross, scan berikutnya mulai dari candle SETELAH
                 # cross — tidak pernah menoleh balik ke candle yang sudah dipakai entry.
                 st['m5_focus_hi'] = float(df_m5['high'].iloc[i]); st['m5_focus_lo'] = float(df_m5['low'].iloc[i])
                 st['m5_focus_ts'] = float(df_m5['ts'].iloc[i])
-                st['ema8_wait'] = None
+                st['ema_wait'] = None
                 return
         # Belum cross sampai batas window → cek apakah window sudah habis
         last_bar_no = (closed_end - 1) - start_i + 1
-        if last_bar_no >= EXPERIMENTAL_EMA8_BARS:
-            log_entry(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA8 tidak cross sampai "
-                      f"{EXPERIMENTAL_EMA8_BARS} candle — dibatalkan, fokus pindah")
+        if last_bar_no >= EXPERIMENTAL_EMA_CROSS_BARS:
+            log_entry(f"🚫 EXPERIMENTAL {coin} {ew['stype']}: EMA3 tidak cross sampai "
+                      f"{EXPERIMENTAL_EMA_CROSS_BARS} candle — dibatalkan, fokus pindah")
             # Fokus ke candle TERAKHIR yang sudah diperiksa dalam window tunggu (bukan candle
             # engulfing awal) — supaya konsisten dgn fix di atas, scan berikutnya tidak menoleh
             # balik ke candle2 yang sudah pernah diperiksa selama fase tunggu.
-            last_i = min(start_i + EXPERIMENTAL_EMA8_BARS - 1, closed_end - 1)
+            last_i = min(start_i + EXPERIMENTAL_EMA_CROSS_BARS - 1, closed_end - 1)
             st['m5_focus_hi'] = float(df_m5['high'].iloc[last_i]); st['m5_focus_lo'] = float(df_m5['low'].iloc[last_i])
             st['m5_focus_ts'] = float(df_m5['ts'].iloc[last_i])
-            st['ema8_wait'] = None
+            st['ema_wait'] = None
         else:
-            st['ema8_wait']['last_checked_ts'] = float(df_m5['ts'].iloc[closed_end - 1])
+            st['ema_wait']['last_checked_ts'] = float(df_m5['ts'].iloc[closed_end - 1])
             # Log status periodik supaya jelas bot masih hidup selama menunggu cross (tidak ada
             # event lain yang bikin log muncul selama fase ini bisa berlangsung s/d 5 candle).
             wait_cycles = ew.get('wait_cycles', 0) + 1
-            st['ema8_wait']['wait_cycles'] = wait_cycles
+            st['ema_wait']['wait_cycles'] = wait_cycles
             if wait_cycles % EXPERIMENTAL_IDLE_LOG_EVERY == 0:
-                log_entry(f"⏳ EXPERIMENTAL {coin} {ew['stype']}: masih menunggu EMA8 cross EMA20 "
-                          f"(candle ke-{last_bar_no}/{EXPERIMENTAL_EMA8_BARS}, sudah {wait_cycles} siklus)")
+                log_entry(f"⏳ EXPERIMENTAL {coin} {ew['stype']}: masih menunggu EMA3 cross EMA20 "
+                          f"(candle ke-{last_bar_no}/{EXPERIMENTAL_EMA_CROSS_BARS}, sudah {wait_cycles} siklus)")
         return   # entry belum terjadi (nunggu cross ATAU baru saja dibatalkan) — scan fokus baru mulai siklus berikutnya
 
     # ── Scan fokus normal (belum ada calon engulfing yang lolos EMA-prev) ──
@@ -3033,14 +3043,14 @@ def check_experimental_engulf(coin, df_m5):
         if engulf_long or engulf_short:
             estype = 'Long' if engulf_long else 'Short'
             # Filter bias H1: hanya lanjutkan kalau arah engulfing SEARAH dengan bias H1
-            # (EMA8/EMA20 cross terakhir di H1). Bias None (belum ada cross H1 live sejak bot
+            # (EMA3/EMA20 cross terakhir di H1). Bias None (belum ada cross H1 live sejak bot
             # start) -> ditolak dulu, tunggu cross H1 pertama.
             if EXPERIMENTAL_H1_BIAS_FILTER:
                 h1_bias = h1_bias_state.get(coin, {}).get('bias')
                 if h1_bias != estype:
                     log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
                               f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                              f"DITOLAK (bias H1 EMA8/EMA20 = {h1_bias or 'belum ada'}, butuh {estype})")
+                              f"DITOLAK (bias H1 EMA3/EMA20 = {h1_bias or 'belum ada'}, butuh {estype})")
                     f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
                     continue
             ema_prev = float(df_m5['ema20'].iloc[i-1])
@@ -3051,33 +3061,43 @@ def check_experimental_engulf(coin, df_m5):
                           f"DITOLAK (candle sebelum engulfing tak sentuh EMA20)")
                 f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
                 continue
-            # Filter tambahan: EXPERIMENTAL_NO_CROSS_BARS candle SEBELUM engulfing (i-N..i-1) tidak
-            # boleh ada EMA8 cross EMA20 sama sekali (arah manapun) — kalau ada, dianggap trennya
-            # belum cukup stabil.
-            no_recent_cross = True
-            for j in range(max(1, i - EXPERIMENTAL_NO_CROSS_BARS), i):
-                e8_j, e20_j = float(df_m5['ema8'].iloc[j]), float(df_m5['ema20'].iloc[j])
-                e8_jp, e20_jp = float(df_m5['ema8'].iloc[j-1]), float(df_m5['ema20'].iloc[j-1])
-                if (e8_jp <= e20_jp and e8_j > e20_j) or (e8_jp >= e20_jp and e8_j < e20_j):
-                    no_recent_cross = False
-                    break
-            if not no_recent_cross:
-                log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
-                          f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
-                          f"DITOLAK (ada EMA8/EMA20 cross dalam 20 candle sebelumnya)")
-                f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
-                continue
-            # Lolos syarat EMA-prev → mulai tunggu cross EMA8/EMA20
+            # Cek cross EMA3/EMA20 SEARAH engulfing di window EXPERIMENTAL_EMA_CROSS_BARS candle
+            # SEBELUM engulfing (i-N..i-1). Kalau ketemu → EMA sudah cross duluan sebelum candle
+            # engulfing ini terbentuk, jadi syarat cross sudah terpenuhi dari awal — entry MARKET
+            # LANGSUNG di candle engulfing ini (harga = close candle i), tidak perlu nunggu lagi.
+            # Kalau ADA beberapa cross searah di window itu, dipakai yang PALING DEKAT ke engulfing.
+            cross_before_i = None
+            for j in range(max(1, i - EXPERIMENTAL_EMA_CROSS_BARS), i):
+                e3_j, e20_j   = float(df_m5['ema3'].iloc[j]),   float(df_m5['ema20'].iloc[j])
+                e3_jp, e20_jp = float(df_m5['ema3'].iloc[j-1]), float(df_m5['ema20'].iloc[j-1])
+                if estype == 'Long' and e3_jp < e20_jp and e3_j >= e20_j:
+                    cross_before_i = j
+                elif estype == 'Short' and e3_jp > e20_jp and e3_j <= e20_j:
+                    cross_before_i = j
+            if cross_before_i is not None:
+                bars_before = i - cross_before_i
+                note = (f"@ candle ke-{bars_before} SEBELUM engulfing "
+                        f"({_ts_wib(df_m5['ts'].iloc[cross_before_i])}) → entry di engulfing "
+                        f"({_ts_wib(df_m5['ts'].iloc[i])})")
+                _experimental_execute_entry(coin, estype, df_m5, i, note=note)
+                # Fokus baru = candle engulfing (tempat entry beneran terjadi) — scan berikutnya
+                # mulai dari candle setelahnya, tidak menoleh balik.
+                st['m5_focus_hi'] = hi; st['m5_focus_lo'] = lo; st['m5_focus_ts'] = float(df_m5['ts'].iloc[i])
+                st['range_base'] = False
+                st['ema_wait'] = None
+                return
+            # Belum ada cross di belakang → mulai tunggu cross EMA3/EMA20 ke DEPAN
             # SL BARU dihitung nanti di titik entry AKTUAL (cross terjadi) — persentase dari harga
             # entry sebenarnya, BUKAN dari ujung candle sebelum engulfing (itu bisa lebar/sempit
             # random tergantung besar candle; sekarang selalu proporsional EXPERIMENTAL_SL_PCT dari
             # harga entry beneran).
             entry_p_est = prev_hi if estype == 'Long' else prev_lo   # cuma estimasi utk log, bukan SL final
             log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
-                      f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev "
-                      f"→ menunggu EMA8 cross EMA20 (maks {EXPERIMENTAL_EMA8_BARS} candle) | "
+                      f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} lolos syarat EMA20-prev, "
+                      f"belum ada cross {EXPERIMENTAL_EMA_CROSS_BARS} candle sebelumnya "
+                      f"→ menunggu EMA3 cross EMA20 ke depan (maks {EXPERIMENTAL_EMA_CROSS_BARS} candle) | "
                       f"entry~{entry_p_est:.6g}")
-            st['ema8_wait'] = {
+            st['ema_wait'] = {
                 'stype': estype, 'engulf_ts': float(df_m5['ts'].iloc[i]), 'prev_hi': prev_hi, 'prev_lo': prev_lo,
                 'last_checked_ts': float(df_m5['ts'].iloc[i-1]),
             }
@@ -3665,7 +3685,7 @@ def run_bot():
 
                 # ── MODE EKSPERIMENTAL: independen total dari jalur IDM/FVG di bawah ──
                 if EXPERIMENTAL_MODE:
-                    # Bias H1 (EMA8/EMA20) selalu di-update, terlepas dari status posisi/hedge —
+                    # Bias H1 (EMA3/EMA20) selalu di-update, terlepas dari status posisi/hedge —
                     # supaya cross H1 tidak pernah terlewat walau slot lagi penuh.
                     if EXPERIMENTAL_H1_BIAS_FILTER:
                         df_h1_exp = get_data(coin, "60", limit=100)
