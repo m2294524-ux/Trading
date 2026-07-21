@@ -723,7 +723,7 @@ EXPERIMENTAL_MODE     = True    # master switch — matikan (False) untuk kembal
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk tunggu cross EMA8/EMA20
 EXPERIMENTAL_SL_PCT   = 0.10    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
-EXPERIMENTAL_NO_CROSS_BARS = 10 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
+EXPERIMENTAL_NO_CROSS_BARS = 3 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
@@ -2848,9 +2848,11 @@ def check_experimental_engulf(coin, df_m5):
             ema8_prev  = float(df_m5['ema8'].iloc[i-1])
             ema20_prev = float(df_m5['ema20'].iloc[i-1])
             crossed = False
-            if ew['stype'] == 'Long' and ema8_prev <= ema20_prev and ema8_i > ema20_i:
+            # "Cross" = EMA8 menyentuh/sama dengan EMA20 (>=/<=), TIDAK perlu benar2 melewati (>/<)
+            # — cukup bersinggungan dari sisi yang berlawanan di candle sebelumnya.
+            if ew['stype'] == 'Long' and ema8_prev < ema20_prev and ema8_i >= ema20_i:
                 crossed = True
-            elif ew['stype'] == 'Short' and ema8_prev >= ema20_prev and ema8_i < ema20_i:
+            elif ew['stype'] == 'Short' and ema8_prev > ema20_prev and ema8_i <= ema20_i:
                 crossed = True
             if crossed:
                 curr_price = float(df_m5['close'].iloc[i])
