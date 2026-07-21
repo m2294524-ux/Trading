@@ -430,6 +430,7 @@ idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
 experimental_pending = {}   # coin -> {'m5_focus_hi','m5_focus_lo','m5_focus_ts', ...} — state mode eksperimental (berbasis TIMESTAMP, bukan index; independen dari pending/idm_pending)
+h1_bias_state    = {}   # coin -> {'last_ts': <ts candle H1 closed terakhir yg sudah diproses>, 'bias': 'Long'/'Short'/None} — patokan arah entry M5 dari cross EMA8/EMA20 H1
 
 def _bos_match(swing_val, choch_level, swing_val2, choch_level2):
     """True kalau dua BOS besar SAMA PERSIS (dipakai cross-check IDM vs FVG di bawah)."""
@@ -725,6 +726,14 @@ EXPERIMENTAL_EMA8_BARS = 5      # jumlah candle (termasuk candle engulfing) utk 
 EXPERIMENTAL_SL_PCT   = 0.10    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
 EXPERIMENTAL_NO_CROSS_BARS = 3 # syarat: TIDAK ada EMA8/EMA20 cross (arah manapun) di N candle sebelum engulfing
 EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
+
+# --- FILTER BIAS H1 (EMA8/EMA20) untuk arah entry M5 mode eksperimental ---
+# H1 dipakai sbg "patokan arah": EMA8 cross EMA20 dari BAWAH ke ATAS di H1 -> bias = Long (hanya
+# cari entry Long di M5). Beberapa candle H1 kemudian, kalau EMA8 cross balik ke BAWAH EMA20 ->
+# bias berganti jadi Short (hanya cari entry Short di M5). Bias tetap berlaku sampai ada cross
+# H1 berlawanan berikutnya (tidak reset tiap candle). Tujuannya mengurangi over-trading krn noise
+# M5 dengan memaksa entry searah tren H1 saja.
+EXPERIMENTAL_H1_BIAS_FILTER = True   # master switch filter ini — False = M5 bebas cari 2 arah spt sebelumnya
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2745,6 +2754,76 @@ def check_m5_engulfing(coin, setup, df_m5, bos_rng, df_h1=None):
     return _scan_engulf(focus_idx, focus_hi, focus_lo)
 
 
+def update_h1_bias(coin, df_h1):
+    """Tentukan/perbarui bias arah entry M5 (mode eksperimental) dari cross EMA8/EMA20 di H1.
+      - EMA8 cross EMA20 dari BAWAH ke ATAS  -> bias = 'Long'  (mode eksperimental hanya cari Long di M5)
+      - EMA8 cross EMA20 dari ATAS ke BAWAH  -> bias = 'Short' (mode eksperimental hanya cari Short di M5)
+    Bias TETAP di arah terakhir sampai ada cross H1 berlawanan berikutnya (bukan sinyal sekali pakai).
+
+    PENTING (anti-bug redeploy) — sama persis pola timestamp yang dipakai check_experimental_engulf:
+    state disimpan sbg TIMESTAMP candle H1 terakhir yang sudah diproses, BUKAN index array (karena
+    window fetch H1 bergeser tiap siklus, index absolut candle yang sama bisa berubah antar siklus).
+    Saat bot baru start / redeploy, TIDAK langsung scan mundur ke histori H1 lawas mencari cross —
+    kalau begitu, cross yang sudah terjadi berjam-jam/berhari lalu bisa "ditemukan lagi" dan langsung
+    dianggap valid utk entry, padahal sudah basi. Sebagai gantinya, inisialisasi hanya mencatat
+    timestamp candle H1 closed TERAKHIR saat itu sbg titik awal, dan bias awal = None (netral, belum
+    ada arah). Hanya cross yang terjadi PERSIS pada candle H1 baru/live setelah titik awal itu yang
+    akan dipakai utk menetapkan/mengubah bias — cross lama sebelum bot jalan diabaikan sepenuhnya.
+    """
+    global h1_bias_state
+    if df_h1 is None or len(df_h1) < 25 or 'ts' not in df_h1.columns:
+        return
+    df = df_h1.copy().reset_index(drop=True)
+    df['ema8']  = df['close'].ewm(span=8,  adjust=False).mean()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    n = len(df)
+    closed_end = n - 1   # exclude candle H1 yang masih berjalan (belum closed)
+
+    def _idx_of_ts(ts_val):
+        matches = df.index[df['ts'] == ts_val]
+        return int(matches[0]) if len(matches) else None
+
+    st = h1_bias_state.get(coin)
+    if st is None:
+        # Inisialisasi pertama kali (termasuk setelah redeploy) — mulai dari candle H1 closed
+        # TERAKHIR, bias netral. Cross-cross lama di histori TIDAK di-scan sama sekali.
+        last_idx = closed_end - 1
+        if last_idx < 1:
+            return   # data H1 belum cukup, tunggu siklus berikutnya
+        st = {'last_ts': float(df['ts'].iloc[last_idx]), 'bias': None}
+        h1_bias_state[coin] = st
+        log_entry(f"👁️  H1 BIAS {coin}: mulai monitoring EMA8/EMA20 H1 dari candle live terakhir "
+                  f"({_ts_wib(df['ts'].iloc[last_idx])}) — cross lama diabaikan, bias awal netral")
+        return
+
+    last_i = _idx_of_ts(st['last_ts'])
+    if last_i is None:
+        # Candle acuan lama sudah keluar window fetch (jarang, window 100 candle H1 ≈ 4 hari) —
+        # reset ke candle live terakhir, bias TETAP dipertahankan (bukan direset ke None) karena
+        # ini cuma pergeseran window, bukan redeploy.
+        last_idx = closed_end - 1
+        if last_idx < 1:
+            return
+        st['last_ts'] = float(df['ts'].iloc[last_idx])
+        log_entry(f"⚠️ H1 BIAS {coin}: candle acuan lama di luar window data — di-reset ke candle live terakhir")
+        return
+
+    for i in range(last_i + 1, closed_end):
+        e8, e20   = float(df['ema8'].iloc[i]),   float(df['ema20'].iloc[i])
+        e8p, e20p = float(df['ema8'].iloc[i-1]), float(df['ema20'].iloc[i-1])
+        if e8p <= e20p and e8 > e20:
+            st['bias'] = 'Long'
+            log_entry(f"🔀 H1 BIAS {coin}: EMA8 cross EMA20 ke ATAS @ {_ts_wib(df['ts'].iloc[i])} "
+                      f"(EMA8={e8:.6g} > EMA20={e20:.6g}) → bias entry M5 = LONG")
+        elif e8p >= e20p and e8 < e20:
+            st['bias'] = 'Short'
+            log_entry(f"🔀 H1 BIAS {coin}: EMA8 cross EMA20 ke BAWAH @ {_ts_wib(df['ts'].iloc[i])} "
+                      f"(EMA8={e8:.6g} < EMA20={e20:.6g}) → bias entry M5 = SHORT")
+
+    if closed_end - 1 >= 0:
+        st['last_ts'] = float(df['ts'].iloc[closed_end - 1])
+
+
 def check_experimental_engulf(coin, df_m5):
     """MODE EKSPERIMENTAL — independen sepenuhnya dari jalur IDM/FVG (tidak ada BOS H1, tidak ada
     gate EMA H1, tidak ada cross-check). Begitu bot start, tiap coin langsung monitoring M5 dari
@@ -2945,6 +3024,17 @@ def check_experimental_engulf(coin, df_m5):
         engulf_short = cl < f_lo and not short_sweep_opp and not range_base
         if engulf_long or engulf_short:
             estype = 'Long' if engulf_long else 'Short'
+            # Filter bias H1: hanya lanjutkan kalau arah engulfing SEARAH dengan bias H1
+            # (EMA8/EMA20 cross terakhir di H1). Bias None (belum ada cross H1 live sejak bot
+            # start) -> ditolak dulu, tunggu cross H1 pertama.
+            if EXPERIMENTAL_H1_BIAS_FILTER:
+                h1_bias = h1_bias_state.get(coin, {}).get('bias')
+                if h1_bias != estype:
+                    log_entry(f"   EXPERIMENTAL {coin} {estype}: engulfing @ "
+                              f"{_ts_wib(df_m5['ts'].iloc[i]) if 'ts' in df_m5.columns else i} "
+                              f"DITOLAK (bias H1 EMA8/EMA20 = {h1_bias or 'belum ada'}, butuh {estype})")
+                    f_hi = hi; f_lo = lo; focus_idx = i; range_base = False
+                    continue
             ema_prev = float(df_m5['ema20'].iloc[i-1])
             prev_ok = (EXPERIMENTAL_EMA_PREV is False) or (prev_lo <= ema_prev <= prev_hi)
             if not prev_ok:
@@ -3534,6 +3624,9 @@ def run_bot():
         slots_used = n_active + n_waitfill
         print(f"\n{'='*55}")
         print(f"📊 SLOT: {slots_used}/{MAX_CONCURRENT} terpakai (posisi:{n_active} | limit:{n_waitfill} | watch:{n_approach})")
+        if EXPERIMENTAL_MODE and EXPERIMENTAL_H1_BIAS_FILTER and h1_bias_state:
+            bias_str = ", ".join(f"{c}:{st.get('bias') or '—'}" for c, st in h1_bias_state.items())
+            print(f"🧭 BIAS H1: {bias_str}")
         if active_positions:
             for c, p in active_positions.items():
                 c = p.get('coin', c)
@@ -3564,6 +3657,11 @@ def run_bot():
 
                 # ── MODE EKSPERIMENTAL: independen total dari jalur IDM/FVG di bawah ──
                 if EXPERIMENTAL_MODE:
+                    # Bias H1 (EMA8/EMA20) selalu di-update, terlepas dari status posisi/hedge —
+                    # supaya cross H1 tidak pernah terlewat walau slot lagi penuh.
+                    if EXPERIMENTAL_H1_BIAS_FILTER:
+                        df_h1_exp = get_data(coin, "60", limit=100)
+                        update_h1_bias(coin, df_h1_exp)
                     if ALLOW_HEDGE or coin not in active_positions:
                         df_m5_exp = get_data(coin, "5", limit=300)
                         check_experimental_engulf(coin, df_m5_exp)
