@@ -276,8 +276,8 @@ session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
 
 # ── Strategy params (sinkron dengan backtest.py) ─────────────
 SL_MULT          = 6.2    # SL = SL_MULT × gap_size dari entry (fallback)
-TRAIL_STOP       = 0.5    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
-TRAIL_ACT_R      = 4.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
+TRAIL_STOP       = 1.0    # trailing distance = TRAIL_STOP × dist (sinkron backtest Trail=0.5R)
+TRAIL_ACT_R      = 9.0    # trail aktif setelah +TRAIL_ACT_R (Bybit min > trailingStop)
 TRAIL_TIMEOUT_DAYS = 3    # close posisi jika peak tidak bergerak selama N hari (sinkron backtest)
 USE_TP           = False  # False = trailing stop AKTIF (TP fix dimatikan)
 RR_TP            = 9.0    # TP di 1:RR_TP (4.0 = 1:4)
@@ -426,6 +426,7 @@ SESSION_FILTER: dict = {
 
 bot_start_ts     = 0     # di-set saat run_bot() mulai — untuk filter sweep historis IDM
 pending          = {}
+struct_pending   = {}   # coin -> {stype: setup} — pipeline baru: BOS H1 -> IDM touch -> BOS M5 lawan arah -> CHoCH balik -> entry 50%/SL 100% range CHoCH
 idm_pending      = {}   # _akey(coin,e_stype) -> limit IDM yg menunggu fill (Fib retrace candle M5)
 active_positions = {}
 inducement_done  = {}   # coin -> signature struktur BOS besar yg sudah di-entry inducement (anti entry-ulang)
@@ -720,10 +721,10 @@ SL_ENGULF_PCT     = 0.05    # SL = entry ± N% range BOS (fixed, proporsional ke
 # tiap kali ada candle yang melewati hi/lo fokus, sama seperti aturan dasar _scan_engulf biasa).
 # TIDAK ADA gate EMA H1, TIDAK ADA cross-check IDM/FVG, TIDAK ADA BOS besar sama sekali — market
 # order langsung begitu syarat di bawah terpenuhi.
-EXPERIMENTAL_MODE     = True    # master switch — matikan (False) untuk kembali ke jalur IDM/FVG biasa
+EXPERIMENTAL_MODE     = False   # master switch mode eksperimental lama — dimatikan, kode dibiarkan (bisa dinyalakan lagi)
 EXPERIMENTAL_EMA_PREV = True    # syarat: candle SEBELUM engulfing (i-1) wick harus sentuh EMA20 M5
 EXPERIMENTAL_EMA_CROSS_BARS = 5      # window candle (SEBELUM & SESUDAH engulfing) utk cari cross EMA3/EMA20
-EXPERIMENTAL_SL_PCT   = 0.15    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
+EXPERIMENTAL_SL_PCT   = 0.10    # SL = entry AKTUAL ± N% dari harga entry (dihitung ulang saat cross terjadi, bukan dari ujung candle)
 EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa event (12 siklus ≈ 1 jam)
 
 # --- FILTER BIAS H1 (EMA3/EMA20) untuk arah entry M5 mode eksperimental ---
@@ -733,6 +734,21 @@ EXPERIMENTAL_IDLE_LOG_EVERY = 12  # log status "masih diam" tiap N siklus tanpa 
 # H1 berlawanan berikutnya (tidak reset tiap candle). Tujuannya mengurangi over-trading krn noise
 # M5 dengan memaksa entry searah tren H1 saja.
 EXPERIMENTAL_H1_BIAS_FILTER = True   # master switch filter ini — False = M5 bebas cari 2 arah spt sebelumnya
+
+# --- MODE STRUKTURAL (aktif) — BOS H1 -> IDM (WAJIB) -> BOS M5 lawan arah -> CHoCH balik -> entry ---
+# BOS H1 + IDM + FVG tetap DIDETEKSI seperti biasa (FVG cuma dihitung utk info/log, TIDAK dipakai
+# sbg syarat/entry). Entry LAMA (gate EMA20 H1, limit di C1-close/trig FVG, entry langsung dari IDM)
+# DIHILANGKAN total — diganti alur baru:
+#   1) BOS H1 + IDM terdeteksi (FVG cuma info) -> setup WAIT_IDM_TOUCH.
+#   2) Harga M5 retrace menyentuh level IDM -> masuk WAIT_M5_CHOCH (mulai monitoring M5).
+#   3) Cari BOS M5 (swing SWING_BARS-SWING_BARS, SAMA seperti BOS H1) di arah LAWAN BOS H1 — BOS m5
+#      ini TIDAK perlu IDM/FVG sendiri, cukup swing break biasa. Mulai dicari dari candle M5 tempat
+#      IDM tersentuh.
+#   4) Tunggu CHoCH: candle M5 CLOSE (bukan cuma wick/sweep) menembus level protektif BOS-m5 tsb,
+#      SEARAH BOS H1 (pembalikan).
+#   5) Entry = limit di 50% range CHoCH (antara level protektif & ekstrem BOS-m5), SL = 100% range
+#      (di ekstrem BOS-m5 itu sendiri).
+STRUCT_MODE = True   # master switch — matikan (False) utk balik ke jalur EMA/FVG/IDM entry lama
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
 RETRACE_LOCK    = 0.50  # ambang retrace yang "mengunci" swing-2 sebagai puncak (50% range BOS)
@@ -2419,6 +2435,10 @@ def _count_slots():
         for s in d.values():
             if s.get('phase') == 'WAIT_FILL':
                 nf += 1
+    for d in struct_pending.values():
+        for s in d.values():
+            if s.get('phase') == 'WAIT_FILL':
+                nf += 1
     return nf
 
 
@@ -3380,6 +3400,269 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
     return 'keep'
 
 
+# ============================================================
+#  MODE STRUKTURAL — BOS H1 -> IDM (wajib) -> BOS M5 lawan arah -> CHoCH balik -> entry 50%/SL 100%
+#  Independen total dari jalur EMA/FVG/IDM lama di atas (check_m5_engulfing / process_setup /
+#  check_inducement_entry / check_idm_pending) — TIDAK menyentuh state 'pending' atau 'idm_pending'.
+# ============================================================
+
+def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_dir=None):
+    """Deteksi BOS H1 terbaru -> IDM (WAJIB, jadi trigger approach) -> setup WAIT_IDM_TOUCH.
+    FVG tetap dihitung (get_internal_gaps/_get_fvgs) HANYA untuk info/log — TIDAK jadi syarat.
+    Sama sekali TIDAK memakai gate EMA20 H1, trig1/C1-close FVG, ataupun entry IDM langsung.
+    force_dir='Long'/'Short' => deteksi HANYA arah itu. Return (setup_dict, logline) atau (None, None).
+    """
+    if not sh_h1 or not sl_h1:
+        return None, None
+    is_long = False; is_short = False; swing_val = None; brk_idx = None
+    if force_dir in (None, "Long"):
+        sv, bi = pick_bos_swing(df_h1_live, sh_h1, sl_h1, "Long")
+        if sv is not None: is_long = True; swing_val = sv; brk_idx = bi
+    if force_dir in (None, "Short"):
+        sv, bi = pick_bos_swing(df_h1_live, sh_h1, sl_h1, "Short")
+        if sv is not None: is_short = True; swing_val = sv; brk_idx = bi
+    if not (is_long or is_short):
+        if verbose: print(f"   {coin}: (struct) tidak ada BOS {force_dir or 'H1'}")
+        return None, None
+    stype = force_dir if force_dir else ("Short" if is_short else "Long")
+    bos_idx, choch_level, peak_val = impulse_anchors(stype, swing_val, brk_idx, sh_h1, sl_h1, df_h1_live)
+    if swing_val is None or bos_idx is None or choch_level is None:
+        if verbose: print(f"   {coin}: (struct) BOS {stype} tak lengkap (swing/choch 5-5 belum terbentuk)")
+        return None, None
+    if stype == "Long":
+        sub = df_h1_live['high'].iloc[bos_idx:]; _B = float(sub.max()); peak_idx = int(sub.idxmax())
+    else:
+        sub = df_h1_live['low'].iloc[bos_idx:]; _B = float(sub.min()); peak_idx = int(sub.idxmin())
+    res = apply_latest_leg(df_h1_live, sh_h1, sl_h1, stype, swing_val, brk_idx, choch_level, peak_val, _B, peak_idx, bos_idx)
+    if res is None:
+        if verbose: print(f"   {coin}: (struct) BOS {stype} — swing-2 ditembus & leg baru tanpa choch 5-5")
+        return None, None
+    swing_val, brk_idx, choch_level, peak_val, bos_idx = res
+    bos_rng = (_B - choch_level) if stype == "Long" else (choch_level - _B)
+    if bos_rng <= 0:
+        return None, None
+    seg_cl = df_h1_live['close'].iloc[peak_idx:]
+    choch_broken = bool((seg_cl < choch_level).any()) if stype == "Long" else bool((seg_cl > choch_level).any())
+    if choch_broken:
+        if verbose: print(f"   {coin}: (struct) BOS {stype} sudah CHoCH — mati, tunggu BOS baru")
+        return None, None
+    if REBREAK_INVALID and peak_val is not None and \
+       rebreak_invalid(df_h1_live, bos_idx, peak_val, choch_level, stype, RETRACE_LOCK):
+        if verbose: print(f"   {coin}: (struct) BOS {stype} INVALID — rebreak swing-2")
+        return None, None
+    # IDM WAJIB — ini sekarang jadi trigger approach satu-satunya (bukan cuma gate FVG lagi)
+    if stype == "Long":
+        ib_lo, ib_hi = _B - INDUCEMENT_ZONE_HI * bos_rng, _B - INDUCEMENT_ZONE_LO * bos_rng
+    else:
+        ib_lo, ib_hi = _B + INDUCEMENT_ZONE_LO * bos_rng, _B + INDUCEMENT_ZONE_HI * bos_rng
+    its_lo = float(df_h1_live['ts'].iloc[bos_idx]); its_hi = float(df_h1_live['ts'].iloc[peak_idx])
+    df_idm = df_h1_live if INDUCEMENT_TF == "60" else get_data(coin, "5", limit=300)
+    idm_chk = find_inducement(df_idm, stype, ib_lo, ib_hi, n=INDUCEMENT_SWING, ts_lo=its_lo, ts_hi=its_hi) if df_idm is not None else None
+    if idm_chk is None:
+        if verbose:
+            print(f"   {coin}: (struct) BOS {stype} TAK ada IDM mini-BOS {INDUCEMENT_SWING}-{INDUCEMENT_SWING} "
+                  f"di pita {INDUCEMENT_ZONE_LO*100:.0f}-{INDUCEMENT_ZONE_HI*100:.0f}% | "
+                  f"break:{swing_val:.6g} choch:{choch_level:.6g} puncak:{_B:.6g}")
+        return None, None
+    # FVG dihitung HANYA utk info/log (tidak dipakai syarat/entry sama sekali)
+    zlo = deepest_retrace_lo(df_h1_live, bos_idx, choch_level, stype)
+    gaps = _get_fvgs(df_h1_live, stype, bos_idx, choch_level, zone_lo=zlo)
+    # Filter sesi & funding — sama seperti jalur lama, biar konsisten kebijakan risikonya
+    import datetime as _dt
+    _h_s = _dt.datetime.utcfromtimestamp(df_h1_live.iloc[-1]['ts_ms'] / 1000).hour if 'ts_ms' in df_h1_live.columns else -1
+    if _h_s >= 0:
+        _sesi = 'Asia' if _h_s < 8 else ('London' if _h_s < 13 else 'NY')
+        _allowed = SESSION_FILTER.get(coin)
+        if _allowed is not None and _sesi not in _allowed:
+            return None, None
+    if FUNDING_FILTER and in_funding_window() and not funding_favors(stype, coin):
+        if verbose:
+            print(f"   {coin}: (struct) BOS {stype} skip — funding window aktif, gak searah")
+        return None, None
+    bos_ts = float(df_h1_live['ts'].iloc[bos_idx])
+    idm_level = float(idm_chk['prot'])
+    choch_str = f"{choch_level:.6g}" if choch_level else "—"
+    logline = (f"\n🧱 {coin} | BOS(struct) {stype} | break:{swing_val:.6g} puncak:{_B:.6g} CHOCH:{choch_str} | "
+               f"IDM:{idm_level:.6g} ({idm_chk['n_trigger']} leg) | FVG:{len(gaps)} (info saja) "
+               f"→ menunggu retrace M5 ke IDM")
+    setup = {
+        'type': stype, 'phase': 'WAIT_IDM_TOUCH',
+        'bos_idx': bos_idx, 'swing_val': swing_val, 'choch_level': choch_level,
+        'peak_val': _B, 'swing2': peak_val, 'bos_rng': bos_rng, 'bos_ts': bos_ts,
+        'idm_level': idm_level, 'idm_n': idm_chk['n_trigger'],
+        'created_ts': time.time(),
+        # State fase M5 (diisi belakangan)
+        'm5_scan_from_ts': None,
+        'm5_swing_val': None, 'm5_choch_level': None, 'm5_peak': None, 'm5_bos_ts': None,
+    }
+    return setup, logline
+
+
+def process_struct_setup(coin, setup, df_m5):
+    """State machine: WAIT_IDM_TOUCH -> WAIT_M5_CHOCH -> WAIT_FILL -> fill.
+    Return: 'remove' | 'keep' | 'lock' (WAIT_FILL) | 'fill'."""
+    stype = setup['type']
+    opp = 'Short' if stype == 'Long' else 'Long'
+    if df_m5 is None or 'ts' not in df_m5.columns or len(df_m5) < (2 * SWING_BARS + 3):
+        return 'keep'
+    n = len(df_m5)
+    closed_end = n - 1   # exclude candle M5 yang masih live/berjalan
+
+    # ── WAIT_IDM_TOUCH: tunggu harga M5 retrace menyentuh level IDM ──
+    if setup['phase'] == 'WAIT_IDM_TOUCH':
+        idm_level = setup['idm_level']; bos_ts = setup['bos_ts']
+        touched_idx = None
+        for i in range(closed_end):
+            if float(df_m5['ts'].iloc[i]) < bos_ts:
+                continue   # abaikan candle SEBELUM BOS H1 terbentuk (anti stale-touch)
+            lo = float(df_m5['low'].iloc[i]); hi = float(df_m5['high'].iloc[i])
+            if (stype == 'Long' and lo <= idm_level) or (stype == 'Short' and hi >= idm_level):
+                touched_idx = i; break
+        if touched_idx is None:
+            return 'keep'
+        setup['m5_scan_from_ts'] = float(df_m5['ts'].iloc[touched_idx])
+        setup['phase'] = 'WAIT_M5_CHOCH'
+        log_entry(f"👁️  {coin} {stype} (struct): IDM {idm_level:.6g} tersentuh M5 @ "
+                  f"{_ts_wib(df_m5['ts'].iloc[touched_idx])} → mulai cari BOS M5 arah {opp}")
+        return 'keep'
+
+    # ── WAIT_M5_CHOCH: cari BOS M5 lawan arah (5-5, tanpa IDM/FVG), lalu tunggu CHoCH balik ──
+    if setup['phase'] == 'WAIT_M5_CHOCH':
+        scan_ts = setup['m5_scan_from_ts']
+        idxs = df_m5.index[(df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)]
+        if len(idxs) < (2 * SWING_BARS + 1):
+            return 'keep'   # belum cukup candle closed sejak IDM tersentuh
+        start_i = int(idxs[0])
+        df_since = df_m5.iloc[start_i:closed_end].reset_index(drop=True)   # hanya candle CLOSED
+        if len(df_since) < (2 * SWING_BARS + 1):
+            return 'keep'
+        sh_m5, sl_m5 = find_last_swing_bos(df_since, n=SWING_BARS)
+        swing_val_m5, brk_idx_m5 = pick_bos_swing(df_since, sh_m5, sl_m5, opp)
+        if swing_val_m5 is None:
+            return 'keep'   # belum ada BOS M5 lawan arah — masih menunggu
+        bos_idx_m5, choch_level_m5, peak_val_m5 = impulse_anchors(opp, swing_val_m5, brk_idx_m5, sh_m5, sl_m5, df_since)
+        if bos_idx_m5 is None or choch_level_m5 is None:
+            return 'keep'
+        if opp == 'Long':
+            sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
+        else:
+            sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
+        res = apply_latest_leg(df_since, sh_m5, sl_m5, opp, swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5, _Bm5, peak_idx_m5, bos_idx_m5)
+        if res is not None:
+            swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5, bos_idx_m5 = res
+            if opp == 'Long':
+                sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max())
+            else:
+                sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min())
+        range_m5 = abs(choch_level_m5 - _Bm5)
+        if range_m5 <= 0:
+            return 'keep'
+        setup['m5_swing_val'] = swing_val_m5; setup['m5_choch_level'] = choch_level_m5
+        setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[bos_idx_m5])
+        # CHoCH = candle M5 CLOSE (bukan cuma wick/sweep) menembus choch_level_m5 SEARAH BOS H1,
+        # terjadi SETELAH bos_idx_m5 (setelah BOS-m5 lawan arah itu terbentuk).
+        seg = df_since.iloc[bos_idx_m5:]
+        brk_mask = (seg['close'] > choch_level_m5) if stype == 'Long' else (seg['close'] < choch_level_m5)
+        if not brk_mask.any():
+            return 'keep'   # BOS-m5 sudah ada, tapi CHoCH balik belum pecah — tetap tunggu
+        active_count = len(active_positions) + _count_slots()
+        if active_count >= MAX_CONCURRENT:
+            log_entry(f"⏸️  {coin} {stype} (struct): CHoCH M5 pecah tapi slot penuh ({active_count}/{MAX_CONCURRENT}) — tunda")
+            return 'keep'
+        range_m5 = abs(choch_level_m5 - _Bm5)
+        entry_p = (choch_level_m5 - 0.5 * range_m5) if stype == 'Long' else (choch_level_m5 + 0.5 * range_m5)
+        sl_p = _Bm5   # = 100% range (ekstrem BOS-m5)
+        side = 'Buy' if stype == 'Long' else 'Sell'
+        log_entry(f"🔀 {coin} {stype} (struct): CHoCH M5 pecah @ choch={choch_level_m5:.6g} "
+                  f"(BOS-m5 {opp} {swing_val_m5:.6g}→ekstrem {_Bm5:.6g}) → limit entry@{entry_p:.6g} SL@{sl_p:.6g} (50%/100% range)")
+        oid = place_limit_order(coin, side, entry_p, sl_p)
+        if oid:
+            setup['entry'] = entry_p; setup['sl'] = sl_p; setup['order_id'] = oid
+            setup['phase'] = 'WAIT_FILL'
+            return 'lock'
+        log_entry(f"⚠️ {coin} {stype} (struct): place_limit_order gagal — dicoba lagi siklus berikutnya")
+        return 'keep'
+
+    # ── WAIT_FILL: limit sudah terpasang, tunggu fill ──
+    if setup['phase'] == 'WAIT_FILL':
+        oid = setup.get('order_id')
+        if oid and not _order_was_filled(coin, oid):
+            if _order_exists(coin, oid):
+                return 'lock'
+            log_entry(f"⚠️ {coin} {stype} (struct): order {oid} hilang & bukan Filled — setup dibuang.")
+            return 'remove'
+        pos = get_open_position(coin, 'Buy' if stype == 'Long' else 'Sell')
+        if pos:
+            entry_p = setup['entry']; sl_p = setup['sl']
+            side_order = 'Buy' if stype == 'Long' else 'Sell'
+            actual_entry = float(pos.get('avgPrice', entry_p))
+            actual_dist = abs(actual_entry - sl_p)
+            min_dist = actual_entry * 0.002
+            if actual_dist < min_dist:
+                actual_dist = min_dist
+                sl_p = actual_entry - actual_dist if side_order == 'Buy' else actual_entry + actual_dist
+            trail_d = TRAIL_STOP * actual_dist
+            info = get_instrument_info(coin); tick = info.get('tick_size', 0.0001)
+            sl_r = round_price(sl_p, tick); trail_r = round_price(trail_d, tick)
+            # Trail trigger (activePrice) dipasang di PUNCAK BOS H1 (setup['peak_val']), bukan lagi
+            # formula TRAIL_ACT_R x dist — jadi otomatis menyesuaikan lebar tiap setup (puncak BOS
+            # bisa jauh/dekat tergantung besar impulsnya). Fallback ke formula lama HANYA kalau
+            # puncak ternyata di sisi yang salah dari entry (mis. data aneh / entry sudah lewat puncak).
+            peak_h1 = setup.get('peak_val')
+            if peak_h1 is not None and (
+                (side_order == 'Buy' and peak_h1 > actual_entry) or
+                (side_order == 'Sell' and peak_h1 < actual_entry)
+            ):
+                active_p = round_price(peak_h1, tick)
+            else:
+                active_p = round_price(actual_entry + TRAIL_ACT_R * actual_dist if side_order == 'Buy'
+                                        else actual_entry - TRAIL_ACT_R * actual_dist, tick)
+            trail_set_ok = False
+            for _attempt in range(3):
+                try:
+                    if USE_TP:
+                        tp_r = round_price(actual_entry + RR_TP * actual_dist if side_order == 'Buy' else actual_entry - RR_TP * actual_dist, tick)
+                        res_ts = session.set_trading_stop(category=CATEGORY, symbol=coin, stopLoss=str(sl_r), takeProfit=str(tp_r), positionIdx=_pidx(side_order))
+                    else:
+                        res_ts = session.set_trading_stop(category=CATEGORY, symbol=coin, stopLoss=str(sl_r), trailingStop=str(trail_r), activePrice=str(active_p), positionIdx=_pidx(side_order))
+                    if res_ts.get('retCode', -1) == 0:
+                        trail_set_ok = True
+                        print(f"🛡️  {coin}: SL={sl_r} " + (f"TP={tp_r} (1:{RR_TP})" if USE_TP else f"Trail={trail_r} act={active_p}"))
+                        break
+                    else:
+                        print(f"⚠️ {coin}: set_trading_stop gagal: {res_ts.get('retMsg','')}"); time.sleep(2)
+                except Exception as e:
+                    print(f"⚠️ {coin}: set_trading_stop error: {e}"); time.sleep(2)
+            if not trail_set_ok:
+                print(f"⚠️ {coin}: Trail gagal — retry M5 berikutnya")
+            active_positions[_akey(coin, stype)] = {
+                'coin': coin, 'side': side_order, 'entry': actual_entry, 'sl': sl_p, 'dist': actual_dist,
+                'trail_dist': trail_d, 'trail_engaged': False, 'trail_set': trail_set_ok,
+                'last_price': actual_entry, 'entry_time': time.time(),
+                'peak': actual_entry, 'peak_time': time.time(),
+                'swing_val': setup.get('swing_val'), 'bos_type': stype, 'rev_count': 0,
+                'orig_ocl': setup.get('entry'),
+                'choch_level': setup.get('m5_choch_level'), 'peak_val': setup.get('m5_peak'),
+                'swing2': setup.get('m5_swing_val'), 'kind': 'struct',
+            }
+            log_entry(f"════ STRUCT FILLED {stype} {coin} ════\n"
+                      f"  entry:{actual_entry:.6f} SL:{sl_p:.6f} | H1 break:{setup.get('swing_val'):.6g} "
+                      f"IDM:{setup.get('idm_level'):.6g} | BOS-m5 {opp}:{setup.get('m5_swing_val'):.6g} "
+                      f"CHoCH-m5:{setup.get('m5_choch_level'):.6g}")
+            print(f"✅ {coin} {stype} (struct): Limit filled! Entry:{actual_entry:.6f} SL:{sl_p:.6f}")
+            return 'fill'
+        else:
+            oid = setup.get('order_id')
+            if oid and not _order_exists(coin, oid):
+                if _order_was_filled(coin, oid):
+                    print(f"📭 {coin} {stype} (struct): Limit filled lalu tutup (SL) — selesai.")
+                else:
+                    log_entry(f"📤 {coin} {stype} (struct): Limit hilang (cancel) — setup dibuang.")
+                return 'remove'
+        return 'lock'
+    return 'keep'
+
+
 def check_idm_pending():
     """Cek limit IDM (Fib) yg menunggu: terisi -> active_positions; kadaluarsa -> batalkan."""
     for key in list(idm_pending.keys()):
@@ -3598,7 +3881,8 @@ def run_bot():
     global bot_start_ts
     bot_start_ts = time.time()   # timestamp saat bot mulai jalan
     load_state()   # muat inducement_done dari file (bertahan lewat redeploy/restart)
-    print("SMC INTI BOT — BOS H1 -> FVG -> Limit @ C1.close -> TP 1:2")
+    print("SMC INTI BOT — " + ("BOS H1 -> IDM touch -> BOS M5 lawan arah -> CHoCH balik -> entry 50%/SL 100% (STRUCT_MODE)"
+          if STRUCT_MODE else "BOS H1 -> FVG -> Limit @ C1.close -> TP 1:2"))
     print(f"CONFIG v9.22 | swing {SWING_BARS}-{SWING_BARS}/sub {SUBLEG_BARS}-{SUBLEG_BARS} | FVG biasa (warna bebas) | "
           f"zona C1 {ENTRY_ZONE_LO*100:.1f}%-{ENTRY_ZONE_HI*100:.0f}%{'(dinamis)' if ZONE_FROM_RETRACE else ''} | "
           f"gap {('<=%.2f%%' % (MAX_GAP_PCT*100)) if MAX_GAP_PCT > 0 else 'bebas'} | "
@@ -3669,6 +3953,16 @@ def run_bot():
                     bk = f"{bk:.6g}" if bk else "—"; pk = f"{pk:.6g}" if pk else "—"; ch = f"{ch:.6g}" if ch else "—"
                     print(f"   {c} [{d}]: {st.get('phase','?')} @ {st.get('entry',0):.6g} | "
                           f"break:{bk} puncak:{pk} CHOCH:{ch}")
+        if struct_pending:
+            for c, dirs in struct_pending.items():
+                for d, st in dirs.items():
+                    bk = st.get('swing_val'); idm = st.get('idm_level')
+                    mch = st.get('m5_choch_level'); mpk = st.get('m5_peak')
+                    bk  = f"{bk:.6g}" if bk else "—"; idm = f"{idm:.6g}" if idm else "—"
+                    mch = f"{mch:.6g}" if mch else "—"; mpk = f"{mpk:.6g}" if mpk else "—"
+                    ent = st.get('entry', 0)
+                    print(f"   {c} [{d}] (struct): {st.get('phase','?')} @ {ent:.6g} | "
+                          f"H1 break:{bk} IDM:{idm} | m5 CHoCH:{mch} m5-ekstrem:{mpk}")
         if idm_pending:
             for k, p in idm_pending.items():
                 trig_p = p.get('trigger', 0); e_st = p.get('e_stype','?')
@@ -3682,6 +3976,70 @@ def run_bot():
         for coin in SYMBOLS:
             try:
                 time.sleep(3)
+
+                # ── MODE STRUKTURAL: BOS H1 -> IDM touch -> BOS M5 lawan arah -> CHoCH balik -> entry ──
+                # Independen total dari jalur EMA/FVG/IDM lama di bawah — tidak menyentuh pending/idm_pending.
+                if STRUCT_MODE:
+                    if FUNDING_FILTER and in_funding_window():
+                        cancel_unfavorable_limits(coin)
+                    if (not ALLOW_HEDGE) and coin in active_positions:
+                        continue
+                    df_h1_live = get_data(coin, "60", limit=100)
+                    if df_h1_live is None:
+                        continue
+                    sh_h1, sl_h1 = find_last_swing_bos(df_h1_live)
+                    df_m5_live = get_data(coin, "5", limit=300)
+
+                    if coin in struct_pending:
+                        dirs = struct_pending[coin]
+                        filled = False
+                        for d in list(dirs.keys()):
+                            action = process_struct_setup(coin, dirs[d], df_m5_live)
+                            if action == 'remove':
+                                if dirs[d].get('order_id'):
+                                    cancel_order(coin, dirs[d]['order_id'])
+                                del dirs[d]
+                            elif action == 'fill':
+                                filled = True
+                                for d2 in list(dirs.keys()):
+                                    if d2 != d and dirs[d2].get('order_id'):
+                                        cancel_order(coin, dirs[d2]['order_id'])
+                                        print(f"🚫 {coin} {d2} (struct): order lawan dibatalkan (arah {d} terisi).")
+                                break
+                        if filled:
+                            struct_pending.pop(coin, None)
+                            continue
+                        # Re-deteksi BOS H1 dua arah — HANYA kalau setup belum WAIT_FILL (limit belum
+                        # terpasang). Sekali WAIT_FILL, biarkan sampai fill/hilang sendiri.
+                        for d in ('Long', 'Short'):
+                            if ALLOW_HEDGE and _akey(coin, d) in active_positions:
+                                continue
+                            cur = dirs.get(d)
+                            if cur is not None and cur.get('phase') == 'WAIT_FILL':
+                                continue
+                            cand, cand_log = build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_dir=d)
+                            if not cand:
+                                continue
+                            if cur is None:
+                                print(f"➕ {coin} {d} (struct): BOS H1 {d} terdeteksi — tambah pantauan")
+                                print(cand_log); dirs[d] = cand
+                            elif cand['swing_val'] != cur.get('swing_val'):
+                                print(f"🔁 {coin} {d} (struct): BOS H1 lebih baru — ganti (break {cur.get('swing_val')} → {cand['swing_val']:.6g})")
+                                print(cand_log); dirs[d] = cand
+                        if not dirs:
+                            struct_pending.pop(coin, None)
+                        continue
+
+                    dirs_new = {}
+                    for d in ('Long', 'Short'):
+                        if ALLOW_HEDGE and _akey(coin, d) in active_positions:
+                            continue
+                        cand, cand_log = build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_dir=d)
+                        if cand:
+                            print(cand_log); dirs_new[d] = cand
+                    if dirs_new:
+                        struct_pending[coin] = dirs_new
+                    continue
 
                 # ── MODE EKSPERIMENTAL: independen total dari jalur IDM/FVG di bawah ──
                 if EXPERIMENTAL_MODE:
