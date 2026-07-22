@@ -741,13 +741,18 @@ EXPERIMENTAL_H1_BIAS_FILTER = True   # master switch filter ini — False = M5 b
 # DIHILANGKAN total — diganti alur baru:
 #   1) BOS H1 + IDM terdeteksi (FVG cuma info) -> setup WAIT_IDM_TOUCH.
 #   2) Harga M5 retrace menyentuh level IDM -> masuk WAIT_M5_CHOCH (mulai monitoring M5).
-#   3) Cari BOS M5 (swing SWING_BARS-SWING_BARS, SAMA seperti BOS H1) di arah LAWAN BOS H1 — BOS m5
-#      ini TIDAK perlu IDM/FVG sendiri, cukup swing break biasa. Mulai dicari dari candle M5 tempat
-#      IDM tersentuh.
-#   4) Tunggu CHoCH: candle M5 CLOSE (bukan cuma wick/sweep) menembus level protektif BOS-m5 tsb,
-#      SEARAH BOS H1 (pembalikan).
-#   5) Entry = limit di 50% range CHoCH (antara level protektif & ekstrem BOS-m5), SL = 100% range
-#      (di ekstrem BOS-m5 itu sendiri).
+#   3) Rantai BOS M5 (ala IDM H1 — find_inducement) di arah LAWAN BOS H1: tiap kali candle bikin
+#      swing SWING_BARS-SWING_BARS (atau lebih) yang lebih ekstrem dari record sebelumnya, itu BOS-m5
+#      baru, fokus geser ke situ. BOS-m5 TIDAK perlu IDM/FVG sendiri.
+#   4) Tunggu CHoCH: candle M5 CLOSE (bukan cuma wick/sweep) menembus level protektif BOS-m5 FOKUS
+#      saat ini, SEARAH BOS H1 (pembalikan).
+#   5) Begitu CHoCH pecah, cari RBS (Resistance Become Support, kalau BOS H1 Long) / SBR (Support
+#      Become Resistance, kalau Short) KECIL di dalam leg itu — dicari dari ujung candle CHoCH break
+#      sampai ujung sekarang/puncak (persis pola pencarian IDM H1 dari choch ke puncak): candle searah
+#      CHoCH close lalu candle lawan open dekat situ & harga menjauh (ada 'space' dulu, wajib), baru
+#      sah jadi level kecil; begitu di-break balik (close) → RBS/SBR terkonfirmasi.
+#   6) Entry = limit di TENGAH zona RBS/SBR (titik close & open candle pembentuknya), SL = 100% range
+#      (ekstrem BOS-m5 fokus).
 STRUCT_MODE = True   # master switch — matikan (False) utk balik ke jalur EMA/FVG/IDM entry lama
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
 ZONE_FROM_RETRACE = True # True = batas bawah zona entry = max(61.8%, retrace terdalam); area yg sudah dilewati retrace tak dipakai
@@ -3498,8 +3503,89 @@ def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_d
     return setup, logline
 
 
+def _m5_bos_chain(df_since, opp, n=SWING_BARS):
+    """Chain BOS M5 ala rantai IDM H1 (mirip find_inducement): walk pivot n-n (default SWING_BARS)
+    searah `opp` secara RECORD-BREAK berturut-turut — tiap kali muncul pivot yang lebih ekstrem dari
+    record sebelumnya, itu 1 leg/'BOS' baru & fokus geser ke situ (persis "kalau bos lagi terbentuk,
+    fokus di bos baru itu"). Leg TERAKHIR = fokus BOS m5 saat ini.
+    leg['swing_val']  = swing LAMA yang baru saja ditembus (titik break BOS ini)
+    leg['choch_level']= level protektif (high/low tertinggi/terendah ANTARA swing lama & swing baru)
+       -> inilah yang harus di-BREAK (CLOSE, bukan wick) utk CHoCH balik ke arah H1
+    leg['extreme_val']= swing BARU (ekstrem BOS ini, dipakai sbg SL 100%-range)
+    leg['choch_idx']  = index (di df_since) tempat level protektif itu terbentuk
+    Return None kalau rantai belum terbentuk (belum ada leg record-break sama sekali)."""
+    sh_m5, sl_m5 = find_last_swing_bos(df_since, n=n)
+    up = (opp == "Long")
+    piv = sorted(sh_m5 if up else sl_m5, key=lambda s: s['idx'])
+    if len(piv) < 2:
+        return None
+    hi_a = df_since['high'].values; lo_a = df_since['low'].values
+    legs = []
+    rec_v, rec_i = piv[0]['val'], piv[0]['idx']
+    for s in piv[1:]:
+        is_break = (s['val'] > rec_v) if up else (s['val'] < rec_v)
+        if not is_break:
+            continue
+        a_seg, b_seg = rec_i + 1, s['idx']
+        if b_seg > a_seg:
+            if up:
+                seg = lo_a[a_seg:b_seg]; off = int(seg.argmin()); tval = float(seg.min())
+            else:
+                seg = hi_a[a_seg:b_seg]; off = int(seg.argmax()); tval = float(seg.max())
+            legs.append({
+                'swing_val': float(rec_v), 'swing_idx': int(rec_i),
+                'choch_level': tval, 'choch_idx': a_seg + off,
+                'extreme_val': float(s['val']), 'extreme_idx': int(s['idx']),
+            })
+        rec_v, rec_i = s['val'], s['idx']
+    if not legs:
+        return None
+    return legs[-1]
+
+
+def _find_m5_rbs(df_seg, stype):
+    """Cari RBS (Resistance Become Support, stype=Long) / SBR (Support Become Resistance, stype=Short)
+    KECIL di dalam leg CHoCH M5, dicari dari UJUNG (candle CHoCH break) ke UJUNG lain (sekarang) —
+    persis seperti IDM H1 dicari dari titik choch ke titik puncak.
+    Pola (contoh Long/RBS): candle1 SEARAH CHoCH (hijau) close, candle2 LAWAN (merah) open dekat situ
+    lalu harga menjauh (turun) — WAJIB ada minimal 1 candle setelahnya yang TIDAK balik menyentuh
+    zona [close1, open2] (ada 'space'/gap dulu, baru sah). Zona itu jadi resisten KECIL. Begitu ada
+    candle yang CLOSE menembus balik ke atas zona itu (searah CHoCH) → RBS terkonfirmasi.
+    Return dict {zone_hi, zone_lo, c1_idx, c2_idx, break_idx} (yang PERTAMA ketemu) atau None."""
+    n = len(df_seg)
+    for i in range(0, n - 2):
+        c1_o, c1_c = float(df_seg['open'].iloc[i]), float(df_seg['close'].iloc[i])
+        c2_o, c2_c = float(df_seg['open'].iloc[i + 1]), float(df_seg['close'].iloc[i + 1])
+        if stype == 'Long':
+            if not (c1_c > c1_o and c2_c < c2_o):   # c1 hijau (searah CHoCH), c2 merah (lawan)
+                continue
+        else:
+            if not (c1_c < c1_o and c2_c > c2_o):   # c1 merah (searah CHoCH), c2 hijau (lawan)
+                continue
+        zone_hi = max(c1_c, c2_o); zone_lo = min(c1_c, c2_o)
+        if zone_hi <= zone_lo:
+            continue
+        space_found = False
+        for j in range(i + 2, n):
+            hi_j = float(df_seg['high'].iloc[j]); lo_j = float(df_seg['low'].iloc[j])
+            cl_j = float(df_seg['close'].iloc[j])
+            if not space_found:
+                if stype == 'Long' and hi_j < zone_lo:
+                    space_found = True
+                elif stype == 'Short' and lo_j > zone_hi:
+                    space_found = True
+                elif not (hi_j < zone_lo or lo_j > zone_hi):
+                    break   # overlap balik SEBELUM sempat ada space -> pola gagal, coba i berikutnya
+                continue
+            if stype == 'Long' and cl_j > zone_hi:
+                return {'zone_hi': zone_hi, 'zone_lo': zone_lo, 'c1_idx': i, 'c2_idx': i + 1, 'break_idx': j}
+            if stype == 'Short' and cl_j < zone_lo:
+                return {'zone_hi': zone_hi, 'zone_lo': zone_lo, 'c1_idx': i, 'c2_idx': i + 1, 'break_idx': j}
+    return None
+
+
 def process_struct_setup(coin, setup, df_m5):
-    """State machine: WAIT_IDM_TOUCH -> WAIT_M5_CHOCH -> WAIT_FILL -> fill.
+    """State machine: WAIT_IDM_TOUCH -> WAIT_M5_CHOCH (rantai BOS-m5 + CHoCH + RBS/SBR) -> WAIT_FILL -> fill.
     Return: 'remove' | 'keep' | 'lock' (WAIT_FILL) | 'fill'."""
     stype = setup['type']
     opp = 'Short' if stype == 'Long' else 'Long'
@@ -3526,7 +3612,7 @@ def process_struct_setup(coin, setup, df_m5):
                   f"{_ts_wib(df_m5['ts'].iloc[touched_idx])} → mulai cari BOS M5 arah {opp}")
         return 'keep'
 
-    # ── WAIT_M5_CHOCH: cari BOS M5 lawan arah (5-5, tanpa IDM/FVG), lalu tunggu CHoCH balik ──
+    # ── WAIT_M5_CHOCH: rantai BOS M5 lawan arah (ala IDM H1), tunggu CHoCH balik, lalu cari RBS/SBR ──
     if setup['phase'] == 'WAIT_M5_CHOCH':
         scan_ts = setup['m5_scan_from_ts']
         idxs = df_m5.index[(df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)]
@@ -3536,45 +3622,44 @@ def process_struct_setup(coin, setup, df_m5):
         df_since = df_m5.iloc[start_i:closed_end].reset_index(drop=True)   # hanya candle CLOSED
         if len(df_since) < (2 * SWING_BARS + 1):
             return 'keep'
-        sh_m5, sl_m5 = find_last_swing_bos(df_since, n=SWING_BARS)
-        swing_val_m5, brk_idx_m5 = pick_bos_swing(df_since, sh_m5, sl_m5, opp)
-        if swing_val_m5 is None:
-            return 'keep'   # belum ada BOS M5 lawan arah — masih menunggu
-        bos_idx_m5, choch_level_m5, peak_val_m5 = impulse_anchors(opp, swing_val_m5, brk_idx_m5, sh_m5, sl_m5, df_since)
-        if bos_idx_m5 is None or choch_level_m5 is None:
-            return 'keep'
-        if opp == 'Long':
-            sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
-        else:
-            sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
-        res = apply_latest_leg(df_since, sh_m5, sl_m5, opp, swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5, _Bm5, peak_idx_m5, bos_idx_m5)
-        if res is not None:
-            swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5, bos_idx_m5 = res
-            if opp == 'Long':
-                sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max())
-            else:
-                sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min())
+        leg = _m5_bos_chain(df_since, opp, n=SWING_BARS)
+        if leg is None:
+            return 'keep'   # rantai BOS M5 lawan arah belum terbentuk sama sekali — masih menunggu
+        swing_val_m5 = leg['swing_val']; choch_level_m5 = leg['choch_level']; _Bm5 = leg['extreme_val']
         range_m5 = abs(choch_level_m5 - _Bm5)
         if range_m5 <= 0:
             return 'keep'
         setup['m5_swing_val'] = swing_val_m5; setup['m5_choch_level'] = choch_level_m5
-        setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[bos_idx_m5])
+        setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[leg['swing_idx']])
         # CHoCH = candle M5 CLOSE (bukan cuma wick/sweep) menembus choch_level_m5 SEARAH BOS H1,
-        # terjadi SETELAH bos_idx_m5 (setelah BOS-m5 lawan arah itu terbentuk).
-        seg = df_since.iloc[bos_idx_m5:]
+        # dicek HANYA setelah leg['choch_idx'] (level protektif leg FOKUS saat ini, bukan leg lama).
+        seg = df_since.iloc[leg['choch_idx']:]
         brk_mask = (seg['close'] > choch_level_m5) if stype == 'Long' else (seg['close'] < choch_level_m5)
         if not brk_mask.any():
-            return 'keep'   # BOS-m5 sudah ada, tapi CHoCH balik belum pecah — tetap tunggu
+            return 'keep'   # BOS-m5 (fokus saat ini) sudah ada, tapi CHoCH balik belum pecah
+        choch_break_idx = int(brk_mask[brk_mask].index[0])   # index absolut di df_since, candle CHoCH pertama pecah
+
+        # ── CHoCH sudah pecah -> cari RBS/SBR KECIL dari ujung (candle CHoCH break) sampai ujung
+        #    lain (sekarang/puncak saat ini) — persis pola pencarian IDM H1 dari choch ke puncak ──
+        df_rbs_seg = df_since.iloc[choch_break_idx:].reset_index(drop=True)
+        if len(df_rbs_seg) < 3:
+            return 'keep'   # baru pecah, belum cukup candle utk bentuk pola RBS/SBR
+        rbs = _find_m5_rbs(df_rbs_seg, stype)
+        if rbs is None:
+            log_entry(f"   {coin} {stype} (struct): CHoCH M5 pecah @ choch={choch_level_m5:.6g} — "
+                      f"menunggu RBS/SBR kecil terbentuk & break (dari {_ts_wib(df_since['ts'].iloc[choch_break_idx])})")
+            return 'keep'
         active_count = len(active_positions) + _count_slots()
         if active_count >= MAX_CONCURRENT:
-            log_entry(f"⏸️  {coin} {stype} (struct): CHoCH M5 pecah tapi slot penuh ({active_count}/{MAX_CONCURRENT}) — tunda")
+            log_entry(f"⏸️  {coin} {stype} (struct): RBS/SBR ketemu tapi slot penuh ({active_count}/{MAX_CONCURRENT}) — tunda")
             return 'keep'
-        range_m5 = abs(choch_level_m5 - _Bm5)
-        entry_p = (choch_level_m5 - 0.5 * range_m5) if stype == 'Long' else (choch_level_m5 + 0.5 * range_m5)
-        sl_p = _Bm5   # = 100% range (ekstrem BOS-m5)
+        entry_p = (rbs['zone_hi'] + rbs['zone_lo']) / 2.0
+        sl_p = _Bm5   # SL tetap di ekstrem BOS-m5 (100% range leg fokus)
         side = 'Buy' if stype == 'Long' else 'Sell'
-        log_entry(f"🔀 {coin} {stype} (struct): CHoCH M5 pecah @ choch={choch_level_m5:.6g} "
-                  f"(BOS-m5 {opp} {swing_val_m5:.6g}→ekstrem {_Bm5:.6g}) → limit entry@{entry_p:.6g} SL@{sl_p:.6g} (50%/100% range)")
+        rbs_label = 'RBS' if stype == 'Long' else 'SBR'
+        log_entry(f"🔀 {coin} {stype} (struct): {rbs_label} @ [{rbs['zone_lo']:.6g}-{rbs['zone_hi']:.6g}] "
+                  f"break @ {_ts_wib(df_rbs_seg['ts'].iloc[rbs['break_idx']])} "
+                  f"(choch M5={choch_level_m5:.6g}, ekstrem BOS-m5={_Bm5:.6g}) → limit entry@{entry_p:.6g} SL@{sl_p:.6g}")
         oid = place_limit_order(coin, side, entry_p, sl_p)
         if oid:
             setup['entry'] = entry_p; setup['sl'] = sl_p; setup['order_id'] = oid
