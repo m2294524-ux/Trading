@@ -742,18 +742,25 @@ EXPERIMENTAL_H1_BIAS_FILTER = True   # master switch filter ini — False = M5 b
 #   1) BOS H1 + FVG (WAJIB ada) + IDM (WAJIB, leg yg dipilih harus tepat di bawahnya ada FVG asli —
 #      bukan cuma leg IDM lain; BOS tanpa FVG / tanpa leg IDM yg FVG-backed dianggap LEMAH & di-skip)
 #      -> setup WAIT_IDM_TOUCH.
-#   2) Harga M5 retrace menyentuh level IDM -> masuk WAIT_M5_CHOCH (mulai monitoring M5).
-#   3) Rantai BOS M5 (ala IDM H1 — find_inducement) di arah LAWAN BOS H1: tiap kali candle bikin
-#      swing SWING_BARS-SWING_BARS (atau lebih) yang lebih ekstrem dari record sebelumnya, itu BOS-m5
-#      baru, fokus geser ke situ. BOS-m5 TIDAK perlu IDM/FVG sendiri.
-#   4) Tunggu CHoCH: candle M5 CLOSE (bukan cuma wick/sweep) menembus level protektif BOS-m5 FOKUS
-#      saat ini, SEARAH BOS H1 (pembalikan).
-#   5) Begitu CHoCH pecah, cari RBS (Resistance Become Support, kalau BOS H1 Long) / SBR (Support
-#      Become Resistance, kalau Short) KECIL di dalam leg itu — dicari dari ujung candle CHoCH break
-#      sampai ujung sekarang/puncak (persis pola pencarian IDM H1 dari choch ke puncak): candle searah
-#      CHoCH close lalu candle lawan open dekat situ & harga menjauh (ada 'space' dulu, wajib), baru
-#      sah jadi level kecil; begitu di-break balik (close) → RBS/SBR terkonfirmasi.
-#   6) Entry = limit di TENGAH zona RBS/SBR (titik close & open candle pembentuknya), SL = 100% range
+#   2) Harga M5 retrace menyentuh level IDM H1 -> masuk WAIT_M5_CHOCH (mulai monitoring M5). Kalau
+#      SETELAH itu harga M5 ternyata menyentuh PUNCAK H1 lagi (bukan reversal, trend cuma lanjut) ->
+#      setup dibuang, tunggu BOS H1 baru (siklus berikutnya otomatis dpt versi ter-update).
+#   3) Bangun BOS-m5 SEBENARNYA di arah LAWAN BOS H1 — PERSIS metode H1 (pick_bos_swing +
+#      impulse_anchors + apply_latest_leg): break, choch_level (level protektif GENUINE), puncak.
+#   4) Di DALAM impuls BOS-m5 itu (dari titik break sampai puncak), cari IDM-m5 (rantai record-break,
+#      PERSIS metode find_inducement/IDM H1) — WAJIB tersentuh dulu sebelum apapun.
+#   5) Setelah IDM-m5 tersentuh, dua kemungkinan:
+#      a) Puncak BOS-m5 tersentuh LAGI -> trend {opp} lanjut (manipulasi belum selesai) -> tunggu
+#         BOS-m5 yang lebih baru terbentuk (otomatis, dihitung ulang tiap siklus).
+#      b) CHoCH: candle CLOSE (bukan wick/sweep) menembus choch_level_m5 SEARAH BOS H1 -> pembalikan
+#         genuine -> lanjut ke #6.
+#   6) Cari RBS (Resistance Become Support, BOS H1 Long) / SBR (Support Become Resistance, Short)
+#      KECIL — dicari dari titik BOS-m5 terbentuk SAMPAI titik CHoCH break saja (di atas titik break
+#      dianggap umpan): candle searah CHoCH close lalu candle lawan open dekat situ & harga menjauh
+#      (ada 'space' dulu, wajib), baru sah jadi level kecil; begitu di-break balik (close) -> RBS/SBR
+#      terkonfirmasi. Kalau TIDAK ADA RBS/SBR di window itu -> JANGAN entry, reset & tunggu BOS-m5
+#      {opp} yang benar-benar baru, tunggu CHoCH lagi.
+#   7) Entry = limit di TENGAH zona RBS/SBR (titik close & open candle pembentuknya), SL = 100% range
 #      (ekstrem BOS-m5 fokus).
 STRUCT_MODE = True   # master switch — matikan (False) utk balik ke jalur EMA/FVG/IDM entry lama
 REBREAK_INVALID = True  # True = BOS batal bila harga retrace >= RETRACE_LOCK lalu close lewati swing-2 (struktur baru)
@@ -3590,46 +3597,6 @@ def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_d
     return setup, logline
 
 
-def _m5_bos_chain(df_since, opp, n=SWING_BARS):
-    """Chain BOS M5 ala rantai IDM H1 (mirip find_inducement): walk pivot n-n (default SWING_BARS)
-    searah `opp` secara RECORD-BREAK berturut-turut — tiap kali muncul pivot yang lebih ekstrem dari
-    record sebelumnya, itu 1 leg/'BOS' baru & fokus geser ke situ (persis "kalau bos lagi terbentuk,
-    fokus di bos baru itu"). Leg TERAKHIR = fokus BOS m5 saat ini.
-    leg['swing_val']  = swing LAMA yang baru saja ditembus (titik break BOS ini)
-    leg['choch_level']= level protektif (high/low tertinggi/terendah ANTARA swing lama & swing baru)
-       -> inilah yang harus di-BREAK (CLOSE, bukan wick) utk CHoCH balik ke arah H1
-    leg['extreme_val']= swing BARU (ekstrem BOS ini, dipakai sbg SL 100%-range)
-    leg['choch_idx']  = index (di df_since) tempat level protektif itu terbentuk
-    Return None kalau rantai belum terbentuk (belum ada leg record-break sama sekali)."""
-    sh_m5, sl_m5 = find_last_swing_bos(df_since, n=n)
-    up = (opp == "Long")
-    piv = sorted(sh_m5 if up else sl_m5, key=lambda s: s['idx'])
-    if len(piv) < 2:
-        return None
-    hi_a = df_since['high'].values; lo_a = df_since['low'].values
-    legs = []
-    rec_v, rec_i = piv[0]['val'], piv[0]['idx']
-    for s in piv[1:]:
-        is_break = (s['val'] > rec_v) if up else (s['val'] < rec_v)
-        if not is_break:
-            continue
-        a_seg, b_seg = rec_i + 1, s['idx']
-        if b_seg > a_seg:
-            if up:
-                seg = lo_a[a_seg:b_seg]; off = int(seg.argmin()); tval = float(seg.min())
-            else:
-                seg = hi_a[a_seg:b_seg]; off = int(seg.argmax()); tval = float(seg.max())
-            legs.append({
-                'swing_val': float(rec_v), 'swing_idx': int(rec_i),
-                'choch_level': tval, 'choch_idx': a_seg + off,
-                'extreme_val': float(s['val']), 'extreme_idx': int(s['idx']),
-            })
-        rec_v, rec_i = s['val'], s['idx']
-    if not legs:
-        return None
-    return legs[-1]
-
-
 def _find_m5_rbs(df_seg, stype):
     """Cari RBS (Resistance Become Support, stype=Long) / SBR (Support Become Resistance, stype=Short)
     KECIL di dalam leg CHoCH M5, dicari dari UJUNG (titik ekstrem/karakter berbalik) ke UJUNG lain
@@ -3716,17 +3683,20 @@ def process_struct_setup(coin, setup, df_m5):
                   f"{_ts_wib(df_m5['ts'].iloc[touched_idx])} → mulai cari BOS M5 arah {opp}")
         return 'keep'
 
-    # ── WAIT_M5_CHOCH: rantai BOS M5 lawan arah (ala IDM H1), tunggu CHoCH balik, lalu cari RBS/SBR
-    #    "dari ujung ke ujung pada CHoCH tersebut" — ujung 1 = titik ekstrem (karakter berbalik),
-    #    ujung 2 = titik CHoCH BREAK itu sendiri (BUKAN sampai sekarang — yang di atas titik break
-    #    biasanya cuma umpan). Kalau CHoCH sudah pecah tapi TIDAK ADA RBS/SBR di window itu, JANGAN
-    #    entry — reset & tunggu BOS-m5 {opp} yang benar-benar baru terbentuk lagi, tunggu CHoCH lagi.
+    # ── WAIT_M5_CHOCH: bangun BOS-m5 SEBENARNYA (persis metode H1), cari IDM-m5 di dalamnya (WAJIB
+    #    tersentuh dulu), baru tentukan: lanjut tren (puncak BOS-m5 tersentuh lagi) atau CHoCH (close
+    #    menembus choch_level_m5 SEARAH H1). Begitu CHoCH valid, cari RBS/SBR "ujung ke ujung" (dari
+    #    titik BOS-m5 terbentuk sampai titik CHoCH break saja — di atas titik break dianggap umpan).
     if setup['phase'] == 'WAIT_M5_CHOCH':
-        # ── Batalkan monitoring M5 kalau SETELAH IDM tersentuh, harga M5 ternyata sudah menyentuh
+        # ── Batalkan monitoring M5 kalau SETELAH IDM H1 tersentuh, harga M5 ternyata sudah menyentuh
         #    PUNCAK H1 (setup['peak_val']) lagi juga — berarti trend cuma lanjut lurus tanpa manipulasi
         #    (BOS-m5 lawan arah), gak perlu nunggu pembalikan. Setup ini dibuang; siklus berikutnya
         #    build_h1_struct_setup akan deteksi ulang BOS H1 yang sudah update (puncak baru lebih
         #    tinggi/rendah), otomatis "ganti BOS baru" & lanjut mantau retrace ke IDM lagi.
+        #    PENTING: setup ini TIDAK boleh diganti/direset oleh re-deteksi H1 biasa di main loop
+        #    selama masih di fase ini (lihat guard di main loop) — supaya peak_val di sini benar-benar
+        #    TETAP/BEKU sejak IDM H1 tersentuh, bukan terus "menyesuaikan" tren yg jalan (kalau terus
+        #    di-refresh, puncak akan SELALU baru saja kesentuh secara trivial & bikin bug loop).
         peak_val = setup.get('peak_val'); scan_ts = setup['m5_scan_from_ts']
         if peak_val is not None:
             touch_mask = (df_m5['high'] >= peak_val) if stype == 'Long' else (df_m5['low'] <= peak_val)
@@ -3737,6 +3707,7 @@ def process_struct_setup(coin, setup, df_m5):
                           f"{_ts_wib(df_m5['ts'].iloc[touch_i])} setelah IDM tersentuh — trend lanjut "
                           f"tanpa pembalikan m5, batalkan monitoring. Tunggu BOS H1 baru.")
                 return 'remove'
+
         idxs = df_m5.index[(df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)]
         if len(idxs) < (2 * SWING_BARS + 1):
             return 'keep'   # belum cukup candle closed sejak IDM tersentuh
@@ -3744,39 +3715,89 @@ def process_struct_setup(coin, setup, df_m5):
         df_since = df_m5.iloc[start_i:closed_end].reset_index(drop=True)   # hanya candle CLOSED
         if len(df_since) < (2 * SWING_BARS + 1):
             return 'keep'
-        leg = _m5_bos_chain(df_since, opp, n=SWING_BARS)
-        if leg is None:
-            return 'keep'   # rantai BOS M5 lawan arah belum terbentuk sama sekali — masih menunggu
-        swing_val_m5 = leg['swing_val']; choch_level_m5 = leg['choch_level']; _Bm5 = leg['extreme_val']
+
+        # 1) Bangun BOS-m5 SEBENARNYA — PERSIS metode H1 (pick_bos_swing + impulse_anchors +
+        #    apply_latest_leg). choch_level_m5 di sini GENUINE (level protektif struktur BOS-m5 itu
+        #    sendiri), BUKAN sekadar titik retracement (itu levelnya IDM-m5, langkah #2 di bawah).
+        sh_m5, sl_m5 = find_last_swing_bos(df_since, n=SWING_BARS)
+        swing_val_m5, brk_idx_m5 = pick_bos_swing(df_since, sh_m5, sl_m5, opp)
+        if swing_val_m5 is None:
+            return 'keep'   # belum ada BOS-m5 lawan arah sama sekali — masih menunggu
+        bos_idx_m5, choch_level_m5, peak_val_m5x = impulse_anchors(opp, swing_val_m5, brk_idx_m5, sh_m5, sl_m5, df_since)
+        if bos_idx_m5 is None or choch_level_m5 is None:
+            return 'keep'
+        if opp == 'Long':
+            sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
+        else:
+            sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
+        res = apply_latest_leg(df_since, sh_m5, sl_m5, opp, swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5x, _Bm5, peak_idx_m5, bos_idx_m5)
+        if res is not None:
+            swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5x, bos_idx_m5 = res
+            if opp == 'Long':
+                sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
+            else:
+                sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
         range_m5 = abs(choch_level_m5 - _Bm5)
-        if range_m5 <= 0:
+        if range_m5 <= 0 or peak_idx_m5 <= bos_idx_m5:
             return 'keep'
         setup['m5_swing_val'] = swing_val_m5; setup['m5_choch_level'] = choch_level_m5
-        setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[leg['swing_idx']])
+        setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[bos_idx_m5])
 
-        # CHoCH = candle M5 CLOSE (bukan cuma wick/sweep) menembus choch_level_m5 SEARAH BOS H1,
-        # dicek dari leg['choch_idx'] (level protektif leg FOKUS saat ini) ke depan.
-        seg = df_since.iloc[leg['choch_idx']:]
-        brk_mask = (seg['close'] > choch_level_m5) if stype == 'Long' else (seg['close'] < choch_level_m5)
-        if not brk_mask.any():
-            return 'keep'   # BOS-m5 (fokus saat ini) sudah ada, tapi CHoCH balik belum pecah
-        choch_break_idx = int(brk_mask[brk_mask].index[0])   # index absolut di df_since, candle CHoCH pertama pecah
+        # 2) Cari IDM-m5 (rantai record-break, PERSIS metode find_inducement/IDM H1) DI DALAM impuls
+        #    BOS-m5 ini (dari bos_idx_m5 sampai peak_idx_m5) — WAJIB kesentuh dulu SEBELUM cek apapun
+        #    lagi ("tunggu idm kesentuh dulu sebelum lanjutkan tren atau choch!").
+        df_bos_m5_seg = df_since.iloc[bos_idx_m5:peak_idx_m5 + 1].reset_index(drop=True)
+        idm_m5_legs = _build_idm_legs(df_bos_m5_seg, opp, n=INDUCEMENT_SWING)
+        if not idm_m5_legs:
+            log_entry(f"   {coin} {stype} (struct): BOS-m5 {opp} break={swing_val_m5:.6g} "
+                      f"choch={choch_level_m5:.6g} puncak={_Bm5:.6g} — IDM-m5 belum terbentuk, menunggu")
+            return 'keep'
+        idm_m5_level = idm_m5_legs[-1][0]
+        idm_m5_abs_idx = bos_idx_m5 + idm_m5_legs[-1][1]   # index absolut di df_since
+        setup['m5_idm'] = idm_m5_level
 
-        # ── Cari RBS/SBR KECIL dari ujung EKSTREM (leg['extreme_idx']) SAMPAI ujung titik CHoCH
-        #    BREAK saja (choch_break_idx, inklusif) — persis pola pencarian IDM H1 dari titik choch
-        #    ke titik puncak, TAPI dibatasi (yang di atas titik break dianggap cuma umpan).
-        df_rbs_seg = df_since.iloc[leg['extreme_idx']:choch_break_idx + 1].reset_index(drop=True)
+        touch_mask_idm = (df_since['low'] <= idm_m5_level) if opp == 'Long' else (df_since['high'] >= idm_m5_level)
+        after_idm_form = touch_mask_idm.iloc[idm_m5_abs_idx + 1:]
+        if not after_idm_form.any():
+            log_entry(f"   {coin} {stype} (struct): BOS-m5 {opp} break={swing_val_m5:.6g} choch={choch_level_m5:.6g} "
+                      f"puncak={_Bm5:.6g} idm={idm_m5_level:.6g} — menunggu IDM-m5 tersentuh")
+            return 'keep'
+        idm_m5_touch_idx = int(after_idm_form.index[after_idm_form][0])
+
+        # 3) IDM-m5 SUDAH tersentuh -> dua kemungkinan:
+        #    a) Puncak BOS-m5 (_Bm5) tersentuh LAGI SESUDAH idm-m5 -> trend {opp} lanjut (manipulasi
+        #       belum selesai) -> JANGAN anggap CHoCH; biarkan siklus berikutnya bangun BOS-m5 yang
+        #       lebih baru (otomatis, krn dihitung ulang dari data terkini tiap siklus).
+        #    b) CHoCH: candle CLOSE (bukan wick/sweep) menembus choch_level_m5 SEARAH BOS H1, SETELAH
+        #       idm-m5 tersentuh -> pembalikan genuine, lanjut cari RBS/SBR.
+        touch_mask_puncak = (df_since['high'] >= _Bm5) if opp == 'Long' else (df_since['low'] <= _Bm5)
+        after_idm_touch_puncak = touch_mask_puncak.iloc[idm_m5_touch_idx + 1:]
+        if after_idm_touch_puncak.any():
+            log_entry(f"➡️  {coin} {stype} (struct): BOS-m5 {opp} idm={idm_m5_level:.6g} tersentuh, tapi "
+                      f"puncak({_Bm5:.6g}) tersentuh LAGI sesudahnya — trend {opp} lanjut, tunggu BOS-m5 baru.")
+            return 'keep'
+
+        brk_mask = (df_since['close'] > choch_level_m5) if stype == 'Long' else (df_since['close'] < choch_level_m5)
+        after_idm_touch_brk = brk_mask.iloc[idm_m5_touch_idx + 1:]
+        if not after_idm_touch_brk.any():
+            return 'keep'   # IDM-m5 sudah tersentuh, tapi belum lanjut trend ATAUPUN CHoCH — tunggu
+        choch_break_idx = int(after_idm_touch_brk.index[after_idm_touch_brk][0])
+
+        # ── Cari RBS/SBR KECIL dari ujung BOS-m5 terbentuk (bos_idx_m5) SAMPAI ujung titik CHoCH
+        #    BREAK saja — persis pola IDM H1, TAPI dibatasi (di atas titik break = umpan).
+        df_rbs_seg = df_since.iloc[bos_idx_m5:choch_break_idx + 1].reset_index(drop=True)
         rbs = _find_m5_rbs(df_rbs_seg, stype) if len(df_rbs_seg) >= 3 else None
         if rbs is None:
-            # CHoCH SUDAH pecah tapi TIDAK ADA RBS/SBR dari ekstrem sampai titik break -> jangan
-            # entry, ini dianggap umpan. RESET: buang leg ini, tunggu BOS-m5 {opp} yang BENAR-BENAR
+            # CHoCH SUDAH pecah tapi TIDAK ADA RBS/SBR dari BOS-m5 sampai titik break -> jangan
+            # entry, dianggap umpan. RESET: buang leg ini, tunggu BOS-m5 {opp} yang BENAR-BENAR
             # BARU terbentuk lagi mulai dari candle CHoCH break ini, lalu tunggu CHoCH lagi.
-            log_entry(f"❌ {coin} {stype} (struct): CHoCH pecah @ {choch_level_m5:.6g} (ekstrem BOS-m5 "
-                      f"{opp}={_Bm5:.6g}) tapi TIDAK ADA RBS/SBR dari ekstrem s/d titik break — "
-                      f"dianggap umpan, batal. Reset: tunggu BOS-m5 {opp} baru dari "
+            log_entry(f"❌ {coin} {stype} (struct): CHoCH pecah @ {choch_level_m5:.6g} (BOS-m5 {opp} "
+                      f"break={swing_val_m5:.6g} puncak={_Bm5:.6g}) tapi TIDAK ADA RBS/SBR — dianggap "
+                      f"umpan, batal. Reset: tunggu BOS-m5 {opp} baru dari "
                       f"{_ts_wib(df_since['ts'].iloc[choch_break_idx])}")
             setup['m5_scan_from_ts'] = float(df_since['ts'].iloc[choch_break_idx])
             setup['m5_swing_val'] = None; setup['m5_choch_level'] = None; setup['m5_peak'] = None
+            setup['m5_idm'] = None
             return 'keep'
         active_count = len(active_positions) + _count_slots()
         if active_count >= MAX_CONCURRENT:
@@ -4223,13 +4244,19 @@ def run_bot():
                         if filled:
                             struct_pending.pop(coin, None)
                             continue
-                        # Re-deteksi BOS H1 dua arah — HANYA kalau setup belum WAIT_FILL (limit belum
-                        # terpasang). Sekali WAIT_FILL, biarkan sampai fill/hilang sendiri.
+                        # Re-deteksi BOS H1 dua arah — HANYA kalau setup masih WAIT_IDM_TOUCH (belum
+                        # mulai monitoring M5 sama sekali). Sekali masuk WAIT_M5_CHOCH atau WAIT_FILL,
+                        # JANGAN diganggu re-deteksi biasa — kalau tidak, peak_val/swing_val terus
+                        # "menyesuaikan" tren yang jalan (self-fulfilling: puncak baru selalu baru saja
+                        # kesentuh), bikin setup di-reset & IDM ke-touch ulang terus tiap siklus tanpa
+                        # pernah sempat memantau M5 dgn benar. Satu-satunya cara keluar dari WAIT_M5_CHOCH
+                        # adalah lewat process_struct_setup sendiri (CHoCH valid, puncak beneran
+                        # kesentuh SETELAH idm, atau limit fill/hilang).
                         for d in ('Long', 'Short'):
                             if ALLOW_HEDGE and _akey(coin, d) in active_positions:
                                 continue
                             cur = dirs.get(d)
-                            if cur is not None and cur.get('phase') == 'WAIT_FILL':
+                            if cur is not None and cur.get('phase') in ('WAIT_M5_CHOCH', 'WAIT_FILL'):
                                 continue
                             cand, cand_log = build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_dir=d)
                             if not cand:
