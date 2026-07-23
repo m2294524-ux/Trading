@@ -299,7 +299,7 @@ SL_CAP_RANGE     = 0.01   # jarak entry->SL = 10% range BOS (lihat SL_FIXED_RANG
 SL_FIXED_RANGE   = True   # True = SL SELALU 10% range BOS (abaikan C1); False = SL ikut C1, di-cap 10% range
 MIN_DIST_FLOOR   = True   # True = dist kecil pakai SL minimum 0.2% (bukan di-skip)
 INDUCEMENT_ENTRY = True   # True = aktif entry inducement (market, kebalik arah BOS besar) berdampingan dgn limit FVG
-INDUCEMENT_ZONE_LO = 0.5 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
+INDUCEMENT_ZONE_LO = 0.268 # bos kecil dicari mulai 26.8% range BOS besar (dari puncak/lembah)
 INDUCEMENT_ZONE_HI = 1.0 # ...sampai 78.6% range. (pita IDM 26.8-78.6%)
 INDUCEMENT_TF    = "60"   # timeframe cari inducement: "5"=M5, "60"=H1
 INDUCEMENT_SWING = 1      # ukuran swing bos kecil MINIMUM: 1-1 (mencakup 2-2..4-4 & asimetris otomatis)
@@ -700,7 +700,7 @@ SUBLEG_BARS = 3
 # Filter zona entry: C1.close (entry) harus berada di retrace ENTRY_ZONE_LO..ENTRY_ZONE_HI
 # dari range BOS, di mana 0% = ekstrem impulse (swing terbaru), 100% = CHOCH (invalidasi).
 # Mis. 0.50..1.00 = hanya zona "diskon" (separuh lebih dalam menuju CHOCH).
-ENTRY_ZONE_LO = 5   # golden ratio / OTE — C1.close minimal retrace 61.8%
+ENTRY_ZONE_LO = 0.0   # golden ratio / OTE — C1.close minimal retrace 61.8%
 ENTRY_ZONE_HI = 1.00
 # Trigger FVG entry = ujung C3 (low[C3] untuk Long, high[C3] untuk Short = batas gap).
 # Zona golden ratio dihitung dari C3 ujung, bukan C1 close.
@@ -3722,7 +3722,21 @@ def process_struct_setup(coin, setup, df_m5):
     #    biasanya cuma umpan). Kalau CHoCH sudah pecah tapi TIDAK ADA RBS/SBR di window itu, JANGAN
     #    entry — reset & tunggu BOS-m5 {opp} yang benar-benar baru terbentuk lagi, tunggu CHoCH lagi.
     if setup['phase'] == 'WAIT_M5_CHOCH':
-        scan_ts = setup['m5_scan_from_ts']
+        # ── Batalkan monitoring M5 kalau SETELAH IDM tersentuh, harga M5 ternyata sudah menyentuh
+        #    PUNCAK H1 (setup['peak_val']) lagi juga — berarti trend cuma lanjut lurus tanpa manipulasi
+        #    (BOS-m5 lawan arah), gak perlu nunggu pembalikan. Setup ini dibuang; siklus berikutnya
+        #    build_h1_struct_setup akan deteksi ulang BOS H1 yang sudah update (puncak baru lebih
+        #    tinggi/rendah), otomatis "ganti BOS baru" & lanjut mantau retrace ke IDM lagi.
+        peak_val = setup.get('peak_val'); scan_ts = setup['m5_scan_from_ts']
+        if peak_val is not None:
+            touch_mask = (df_m5['high'] >= peak_val) if stype == 'Long' else (df_m5['low'] <= peak_val)
+            after_touch = touch_mask & (df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)
+            if after_touch.any():
+                touch_i = int(df_m5.index[after_touch][0])
+                log_entry(f"🏁 {coin} {stype} (struct): puncak H1 ({peak_val:.6g}) kesentuh lagi @ "
+                          f"{_ts_wib(df_m5['ts'].iloc[touch_i])} setelah IDM tersentuh — trend lanjut "
+                          f"tanpa pembalikan m5, batalkan monitoring. Tunggu BOS H1 baru.")
+                return 'remove'
         idxs = df_m5.index[(df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)]
         if len(idxs) < (2 * SWING_BARS + 1):
             return 'keep'   # belum cukup candle closed sejak IDM tersentuh
