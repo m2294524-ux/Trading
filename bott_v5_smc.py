@@ -739,7 +739,9 @@ EXPERIMENTAL_H1_BIAS_FILTER = True   # master switch filter ini — False = M5 b
 # BOS H1 + IDM + FVG tetap DIDETEKSI seperti biasa (FVG cuma dihitung utk info/log, TIDAK dipakai
 # sbg syarat/entry). Entry LAMA (gate EMA20 H1, limit di C1-close/trig FVG, entry langsung dari IDM)
 # DIHILANGKAN total — diganti alur baru:
-#   1) BOS H1 + IDM terdeteksi (FVG cuma info) -> setup WAIT_IDM_TOUCH.
+#   1) BOS H1 + FVG (WAJIB ada) + IDM (WAJIB, leg yg dipilih harus tepat di bawahnya ada FVG asli —
+#      bukan cuma leg IDM lain; BOS tanpa FVG / tanpa leg IDM yg FVG-backed dianggap LEMAH & di-skip)
+#      -> setup WAIT_IDM_TOUCH.
 #   2) Harga M5 retrace menyentuh level IDM -> masuk WAIT_M5_CHOCH (mulai monitoring M5).
 #   3) Rantai BOS M5 (ala IDM H1 — find_inducement) di arah LAWAN BOS H1: tiap kali candle bikin
 #      swing SWING_BARS-SWING_BARS (atau lebih) yang lebih ekstrem dari record sebelumnya, itu BOS-m5
@@ -3411,9 +3413,79 @@ def process_setup(coin, setup, df_h1_live, curr_h1, df_m5=None):
 #  check_inducement_entry / check_idm_pending) — TIDAK menyentuh state 'pending' atau 'idm_pending'.
 # ============================================================
 
+def _build_idm_legs(df_tf, big_stype, n=1, ts_lo=None, ts_hi=None):
+    """Bangun rantai leg IDM — PERSIS logika inti find_inducement (record-break berturut) — tapi
+    TANPA memfilter ke satu leg 'terbaik'. Dipakai saat butuh SEMUA leg (bukan cuma leg terakhir)
+    supaya bisa difilter lagi (mis. filter FVG-backed). Return list leg (trigger_val, trigger_idx,
+    broken_peak_val, broken_peak_idx), urut kronologis (leg terakhir = paling dekat puncak)."""
+    if df_tf is None or len(df_tf) < (2 * n + 1):
+        return []
+    sh_tf, sl_tf = find_last_swing_bos(df_tf, n=n)
+    if not sh_tf or not sl_tf:
+        return []
+    ts_col = df_tf['ts']
+    def _in_win(idx):
+        if ts_lo is None:
+            return True
+        t = float(ts_col.iloc[idx])
+        return ts_lo <= t <= ts_hi
+    up = (big_stype == "Long")
+    piv = [s for s in (sh_tf if up else sl_tf) if _in_win(s['idx'])]
+    piv.sort(key=lambda s: s['idx'])
+    if len(piv) < 2:
+        return []
+    lo_a = df_tf['low'].values; hi_a = df_tf['high'].values
+    legs = []
+    rec_v, rec_i = piv[0]['val'], piv[0]['idx']
+    for s in piv[1:]:
+        is_break = (s['val'] > rec_v) if up else (s['val'] < rec_v)
+        if not is_break:
+            continue
+        a_seg, b_seg = rec_i + 1, s['idx']
+        if b_seg > a_seg:
+            if up:
+                seg = lo_a[a_seg:b_seg]; off = int(seg.argmin()); tval = float(seg.min())
+            else:
+                seg = hi_a[a_seg:b_seg]; off = int(seg.argmax()); tval = float(seg.max())
+            legs.append((tval, a_seg + off, rec_v, rec_i))
+        rec_v, rec_i = s['val'], s['idx']
+    return legs
+
+
+def _pick_fvg_backed_idm(legs, gaps, stype):
+    """Dari daftar leg IDM (rantai record-break, biasanya BANYAK), pilih leg yang PALING DEKAT
+    PUNCAK tapi TEPAT DI BAWAHNYA ada FVG asli — bukan cuma leg IDM lain lagi.
+    Alasan: kalau leg TERAKHIR (paling dekat puncak, yang biasanya jadi default) ternyata di
+    bawahnya cuma ketemu leg IDM lain (tanpa FVG di antaranya), itu IDM lemah — turun ke leg
+    SEBELUMNYA, ulangi sampai ketemu yang bawahnya FVG asli. Kalau tidak ada satupun → None.
+    (Long: 'bawah' = harga lebih rendah. Short: 'bawah'/lawan = harga lebih tinggi.)"""
+    if not legs or not gaps:
+        return None
+    legs_sorted = sorted(legs, key=lambda lg: lg[0], reverse=(stype == "Long"))
+    for lg in legs_sorted:
+        trig = lg[0]
+        lower_legs = [o[0] for o in legs_sorted if o is not lg and
+                      ((o[0] < trig) if stype == "Long" else (o[0] > trig))]
+        nearest_lower_leg = (max(lower_legs) if stype == "Long" else min(lower_legs)) if lower_legs else None
+        if stype == "Long":
+            cand = [g['top'] for g in gaps if g['top'] <= trig]
+            nearest_gap = max(cand) if cand else None
+        else:
+            cand = [g['bottom'] for g in gaps if g['bottom'] >= trig]
+            nearest_gap = min(cand) if cand else None
+        if nearest_gap is None:
+            continue   # gak ada FVG sama sekali di bawah leg ini -> skip, coba leg lebih rendah
+        if nearest_lower_leg is None or \
+           (stype == "Long" and nearest_gap > nearest_lower_leg) or \
+           (stype == "Short" and nearest_gap < nearest_lower_leg):
+            return lg   # FVG lebih dekat ke leg ini drpd leg IDM lain -> "bawahnya langsung FVG"
+    return None
+
+
 def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_dir=None):
-    """Deteksi BOS H1 terbaru -> IDM (WAJIB, jadi trigger approach) -> setup WAIT_IDM_TOUCH.
-    FVG tetap dihitung (get_internal_gaps/_get_fvgs) HANYA untuk info/log — TIDAK jadi syarat.
+    """Deteksi BOS H1 terbaru -> FVG (WAJIB ADA) -> IDM (WAJIB, & harus leg yg tepat di bawahnya
+    ada FVG asli) -> setup WAIT_IDM_TOUCH. BOS tanpa FVG dianggap LEMAH dan di-skip; begitu juga
+    kalau semua leg IDM di pita ternyata di bawahnya cuma ketemu IDM lain (bukan FVG).
     Sama sekali TIDAK memakai gate EMA20 H1, trig1/C1-close FVG, ataupun entry IDM langsung.
     force_dir='Long'/'Short' => deteksi HANYA arah itu. Return (setup_dict, logline) atau (None, None).
     """
@@ -3455,23 +3527,38 @@ def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_d
        rebreak_invalid(df_h1_live, bos_idx, peak_val, choch_level, stype, RETRACE_LOCK):
         if verbose: print(f"   {coin}: (struct) BOS {stype} INVALID — rebreak swing-2")
         return None, None
-    # IDM WAJIB — ini sekarang jadi trigger approach satu-satunya (bukan cuma gate FVG lagi)
+    # FVG dihitung DULU (bukan cuma info lagi) — dipakai memilih leg IDM mana yang valid.
+    zlo = deepest_retrace_lo(df_h1_live, bos_idx, choch_level, stype)
+    gaps = _get_fvgs(df_h1_live, stype, bos_idx, choch_level, zone_lo=zlo)
+    if not gaps:
+        if verbose:
+            print(f"   {coin}: (struct) BOS {stype} TAK ADA FVG sama sekali — BOS dianggap lemah, skip")
+        return None, None
+    # IDM WAJIB — dan HARUS leg yang tepat di bawahnya (Long) / atasnya (Short) ada FVG asli, bukan
+    # cuma leg IDM lain lagi (rantai record-break bisa dapat banyak leg; leg paling dekat puncak
+    # sering kali "cuma umpan" kalau di bawahnya ternyata IDM lain, bukan FVG).
     if stype == "Long":
         ib_lo, ib_hi = _B - INDUCEMENT_ZONE_HI * bos_rng, _B - INDUCEMENT_ZONE_LO * bos_rng
     else:
         ib_lo, ib_hi = _B + INDUCEMENT_ZONE_LO * bos_rng, _B + INDUCEMENT_ZONE_HI * bos_rng
     its_lo = float(df_h1_live['ts'].iloc[bos_idx]); its_hi = float(df_h1_live['ts'].iloc[peak_idx])
     df_idm = df_h1_live if INDUCEMENT_TF == "60" else get_data(coin, "5", limit=300)
-    idm_chk = find_inducement(df_idm, stype, ib_lo, ib_hi, n=INDUCEMENT_SWING, ts_lo=its_lo, ts_hi=its_hi) if df_idm is not None else None
-    if idm_chk is None:
+    all_legs = _build_idm_legs(df_idm, stype, n=INDUCEMENT_SWING, ts_lo=its_lo, ts_hi=its_hi) if df_idm is not None else []
+    inband_legs = [lg for lg in all_legs if ib_lo <= lg[0] <= ib_hi]
+    if not inband_legs:
         if verbose:
             print(f"   {coin}: (struct) BOS {stype} TAK ada IDM mini-BOS {INDUCEMENT_SWING}-{INDUCEMENT_SWING} "
                   f"di pita {INDUCEMENT_ZONE_LO*100:.0f}-{INDUCEMENT_ZONE_HI*100:.0f}% | "
                   f"break:{swing_val:.6g} choch:{choch_level:.6g} puncak:{_B:.6g}")
         return None, None
-    # FVG dihitung HANYA utk info/log (tidak dipakai syarat/entry sama sekali)
-    zlo = deepest_retrace_lo(df_h1_live, bos_idx, choch_level, stype)
-    gaps = _get_fvgs(df_h1_live, stype, bos_idx, choch_level, zone_lo=zlo)
+    chosen = _pick_fvg_backed_idm(inband_legs, gaps, stype)
+    if chosen is None:
+        if verbose:
+            print(f"   {coin}: (struct) BOS {stype} ada {len(inband_legs)} leg IDM di pita, tapi TAK ADA "
+                  f"yg tepat di bawahnya FVG asli (semua cuma ketemu IDM lain) — BOS dianggap lemah, skip")
+        return None, None
+    idm_chk = {'prot': chosen[0], 'prot_idx': chosen[1], 'micro_val': chosen[2], 'micro_idx': chosen[3],
+               'n_trigger': len(inband_legs)}
     # Filter sesi & funding — sama seperti jalur lama, biar konsisten kebijakan risikonya
     import datetime as _dt
     _h_s = _dt.datetime.utcfromtimestamp(df_h1_live.iloc[-1]['ts_ms'] / 1000).hour if 'ts_ms' in df_h1_live.columns else -1
@@ -3488,7 +3575,7 @@ def build_h1_struct_setup(coin, df_h1_live, sh_h1, sl_h1, verbose=False, force_d
     idm_level = float(idm_chk['prot'])
     choch_str = f"{choch_level:.6g}" if choch_level else "—"
     logline = (f"\n🧱 {coin} | BOS(struct) {stype} | break:{swing_val:.6g} puncak:{_B:.6g} CHOCH:{choch_str} | "
-               f"IDM:{idm_level:.6g} ({idm_chk['n_trigger']} leg) | FVG:{len(gaps)} (info saja) "
+               f"IDM(FVG-backed):{idm_level:.6g} ({idm_chk['n_trigger']} leg di pita) | FVG:{len(gaps)} "
                f"→ menunggu retrace M5 ke IDM")
     setup = {
         'type': stype, 'phase': 'WAIT_IDM_TOUCH',
@@ -3629,10 +3716,11 @@ def process_struct_setup(coin, setup, df_m5):
                   f"{_ts_wib(df_m5['ts'].iloc[touched_idx])} → mulai cari BOS M5 arah {opp}")
         return 'keep'
 
-    # ── WAIT_M5_CHOCH: rantai BOS M5 lawan arah (ala IDM H1), lalu cari RBS/SBR "dari ujung ke ujung
-    #    pada CHoCH tersebut" — ujung 1 = titik ekstrem (tempat karakter berbalik), ujung 2 = sekarang.
-    #    RBS/SBR sendiri yang jadi konfirmasi pembalikan — TIDAK perlu nunggu choch_level (level
-    #    swing yang ditembus BOS-m5) pecah dulu; break RBS/SBR bisa terjadi jauh SEBELUM itu.
+    # ── WAIT_M5_CHOCH: rantai BOS M5 lawan arah (ala IDM H1), tunggu CHoCH balik, lalu cari RBS/SBR
+    #    "dari ujung ke ujung pada CHoCH tersebut" — ujung 1 = titik ekstrem (karakter berbalik),
+    #    ujung 2 = titik CHoCH BREAK itu sendiri (BUKAN sampai sekarang — yang di atas titik break
+    #    biasanya cuma umpan). Kalau CHoCH sudah pecah tapi TIDAK ADA RBS/SBR di window itu, JANGAN
+    #    entry — reset & tunggu BOS-m5 {opp} yang benar-benar baru terbentuk lagi, tunggu CHoCH lagi.
     if setup['phase'] == 'WAIT_M5_CHOCH':
         scan_ts = setup['m5_scan_from_ts']
         idxs = df_m5.index[(df_m5['ts'] >= scan_ts) & (df_m5.index < closed_end)]
@@ -3652,15 +3740,29 @@ def process_struct_setup(coin, setup, df_m5):
         setup['m5_swing_val'] = swing_val_m5; setup['m5_choch_level'] = choch_level_m5
         setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[leg['swing_idx']])
 
-        # ── Cari RBS/SBR KECIL dari ujung EKSTREM (titik karakter berbalik, leg['extreme_idx'])
-        #    sampai ujung SEKARANG — persis pola pencarian IDM H1 dari titik choch ke titik puncak.
-        df_rbs_seg = df_since.iloc[leg['extreme_idx']:].reset_index(drop=True)
-        if len(df_rbs_seg) < 3:
-            return 'keep'   # ekstrem baru kebentuk, belum cukup candle utk pola RBS/SBR
-        rbs = _find_m5_rbs(df_rbs_seg, stype)
+        # CHoCH = candle M5 CLOSE (bukan cuma wick/sweep) menembus choch_level_m5 SEARAH BOS H1,
+        # dicek dari leg['choch_idx'] (level protektif leg FOKUS saat ini) ke depan.
+        seg = df_since.iloc[leg['choch_idx']:]
+        brk_mask = (seg['close'] > choch_level_m5) if stype == 'Long' else (seg['close'] < choch_level_m5)
+        if not brk_mask.any():
+            return 'keep'   # BOS-m5 (fokus saat ini) sudah ada, tapi CHoCH balik belum pecah
+        choch_break_idx = int(brk_mask[brk_mask].index[0])   # index absolut di df_since, candle CHoCH pertama pecah
+
+        # ── Cari RBS/SBR KECIL dari ujung EKSTREM (leg['extreme_idx']) SAMPAI ujung titik CHoCH
+        #    BREAK saja (choch_break_idx, inklusif) — persis pola pencarian IDM H1 dari titik choch
+        #    ke titik puncak, TAPI dibatasi (yang di atas titik break dianggap cuma umpan).
+        df_rbs_seg = df_since.iloc[leg['extreme_idx']:choch_break_idx + 1].reset_index(drop=True)
+        rbs = _find_m5_rbs(df_rbs_seg, stype) if len(df_rbs_seg) >= 3 else None
         if rbs is None:
-            log_entry(f"   {coin} {stype} (struct): BOS-m5 {opp} ekstrem={_Bm5:.6g} — "
-                      f"menunggu RBS/SBR kecil terbentuk & break (dari {_ts_wib(df_since['ts'].iloc[leg['extreme_idx']])})")
+            # CHoCH SUDAH pecah tapi TIDAK ADA RBS/SBR dari ekstrem sampai titik break -> jangan
+            # entry, ini dianggap umpan. RESET: buang leg ini, tunggu BOS-m5 {opp} yang BENAR-BENAR
+            # BARU terbentuk lagi mulai dari candle CHoCH break ini, lalu tunggu CHoCH lagi.
+            log_entry(f"❌ {coin} {stype} (struct): CHoCH pecah @ {choch_level_m5:.6g} (ekstrem BOS-m5 "
+                      f"{opp}={_Bm5:.6g}) tapi TIDAK ADA RBS/SBR dari ekstrem s/d titik break — "
+                      f"dianggap umpan, batal. Reset: tunggu BOS-m5 {opp} baru dari "
+                      f"{_ts_wib(df_since['ts'].iloc[choch_break_idx])}")
+            setup['m5_scan_from_ts'] = float(df_since['ts'].iloc[choch_break_idx])
+            setup['m5_swing_val'] = None; setup['m5_choch_level'] = None; setup['m5_peak'] = None
             return 'keep'
         active_count = len(active_positions) + _count_slots()
         if active_count >= MAX_CONCURRENT:
