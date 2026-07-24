@@ -3729,44 +3729,47 @@ def process_struct_setup(coin, setup, df_m5):
         if len(df_since) < (2 * SWING_BARS + 1):
             return 'keep'
 
-        # 1) Bangun BOS-m5 SEBENARNYA — PERSIS metode H1 (pick_bos_swing + impulse_anchors +
-        #    apply_latest_leg). choch_level_m5 di sini GENUINE (level protektif struktur BOS-m5 itu
-        #    sendiri), BUKAN sekadar titik retracement (itu levelnya IDM-m5, langkah #2 di bawah).
-        sh_m5, sl_m5 = find_last_swing_bos(df_since, n=SWING_BARS)
-        swing_val_m5, brk_idx_m5 = pick_bos_swing(df_since, sh_m5, sl_m5, opp)
-        if swing_val_m5 is None:
-            return 'keep'   # belum ada BOS-m5 lawan arah sama sekali — masih menunggu
-        bos_idx_m5, choch_level_m5, peak_val_m5x = impulse_anchors(opp, swing_val_m5, brk_idx_m5, sh_m5, sl_m5, df_since)
-        if bos_idx_m5 is None or choch_level_m5 is None:
+        # 1) Bangun BOS-m5 — pakai _build_idm_legs (rantai record-break SWING_BARS-SWING_BARS).
+        #    choch_level_m5 = high/low protektif ANTAR DUA RECORD-BREAK (benar), bukan swing high/low
+        #    terdekat setelah break (yang salah, seperti pick_bos_swing+impulse_anchors+apply_latest_leg).
+        #    Pilih leg PALING BARU yang IDM-m5-nya sudah terbentuk di dalam impuls itu. Ini penting
+        #    karena leg paling baru secara absolut belum tentu punya IDM-m5 — kalau belum ada IDM-m5,
+        #    turun ke leg sebelumnya yang sudah punya IDM-m5 (persis prinsip rantai IDM H1: leg yang
+        #    valid adalah yang punya struktur lengkap, bukan yang paling ujung kalau belum siap).
+        bos_legs = _build_idm_legs(df_since, opp, n=SWING_BARS)
+        if not bos_legs:
+            return 'keep'   # BOS-m5 lawan arah belum terbentuk sama sekali — masih menunggu
+        # Cari leg paling baru (dari belakang) yang IDM-m5-nya sudah ada
+        chosen_leg = None; chosen_puncak = None; chosen_peak_idx = None
+        chosen_idm_level = None; chosen_idm_abs_idx = None
+        for leg in reversed(bos_legs):
+            sw_v = leg[2]; sw_i = leg[3]
+            sub_ext = df_since['low'].iloc[sw_i:] if opp == 'Short' else df_since['high'].iloc[sw_i:]
+            pk_v = float(sub_ext.min() if opp == 'Short' else sub_ext.max())
+            pk_i = int(sub_ext.idxmin() if opp == 'Short' else sub_ext.idxmax())
+            if pk_i <= sw_i:
+                continue
+            df_bos_seg = df_since.iloc[sw_i:pk_i + 1].reset_index(drop=True)
+            idm_legs_m5 = _build_idm_legs(df_bos_seg, opp, n=INDUCEMENT_SWING)
+            if not idm_legs_m5:
+                continue   # leg ini belum punya IDM-m5 → coba leg sebelumnya
+            chosen_leg = leg; chosen_puncak = pk_v; chosen_peak_idx = pk_i
+            chosen_idm_level = idm_legs_m5[-1][0]
+            chosen_idm_abs_idx = sw_i + idm_legs_m5[-1][1]
+            break
+        if chosen_leg is None:
+            log_entry(f"   {coin} {stype} (struct): ada {len(bos_legs)} leg BOS-m5 {opp} tapi "
+                      f"belum ada yg punya IDM-m5 — menunggu")
             return 'keep'
-        if opp == 'Long':
-            sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
-        else:
-            sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
-        res = apply_latest_leg(df_since, sh_m5, sl_m5, opp, swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5x, _Bm5, peak_idx_m5, bos_idx_m5)
-        if res is not None:
-            swing_val_m5, brk_idx_m5, choch_level_m5, peak_val_m5x, bos_idx_m5 = res
-            if opp == 'Long':
-                sub = df_since['high'].iloc[bos_idx_m5:]; _Bm5 = float(sub.max()); peak_idx_m5 = int(sub.idxmax())
-            else:
-                sub = df_since['low'].iloc[bos_idx_m5:]; _Bm5 = float(sub.min()); peak_idx_m5 = int(sub.idxmin())
+        swing_val_m5 = chosen_leg[2]; choch_level_m5 = chosen_leg[0]
+        _Bm5 = chosen_puncak; peak_idx_m5 = chosen_peak_idx
+        bos_idx_m5 = chosen_leg[3]
+        idm_m5_level = chosen_idm_level; idm_m5_abs_idx = chosen_idm_abs_idx
         range_m5 = abs(choch_level_m5 - _Bm5)
         if range_m5 <= 0 or peak_idx_m5 <= bos_idx_m5:
             return 'keep'
         setup['m5_swing_val'] = swing_val_m5; setup['m5_choch_level'] = choch_level_m5
         setup['m5_peak'] = _Bm5; setup['m5_bos_ts'] = float(df_since['ts'].iloc[bos_idx_m5])
-
-        # 2) Cari IDM-m5 (rantai record-break, PERSIS metode find_inducement/IDM H1) DI DALAM impuls
-        #    BOS-m5 ini (dari bos_idx_m5 sampai peak_idx_m5) — WAJIB kesentuh dulu SEBELUM cek apapun
-        #    lagi ("tunggu idm kesentuh dulu sebelum lanjutkan tren atau choch!").
-        df_bos_m5_seg = df_since.iloc[bos_idx_m5:peak_idx_m5 + 1].reset_index(drop=True)
-        idm_m5_legs = _build_idm_legs(df_bos_m5_seg, opp, n=INDUCEMENT_SWING)
-        if not idm_m5_legs:
-            log_entry(f"   {coin} {stype} (struct): BOS-m5 {opp} break={swing_val_m5:.6g} "
-                      f"choch={choch_level_m5:.6g} puncak={_Bm5:.6g} — IDM-m5 belum terbentuk, menunggu")
-            return 'keep'
-        idm_m5_level = idm_m5_legs[-1][0]
-        idm_m5_abs_idx = bos_idx_m5 + idm_m5_legs[-1][1]   # index absolut di df_since
         setup['m5_idm'] = idm_m5_level
 
         touch_mask_idm = (df_since['low'] <= idm_m5_level) if opp == 'Long' else (df_since['high'] >= idm_m5_level)
