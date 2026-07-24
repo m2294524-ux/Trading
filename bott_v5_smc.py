@@ -3677,6 +3677,19 @@ def process_struct_setup(coin, setup, df_m5):
                 touched_idx = i; break
         if touched_idx is None:
             return 'keep'
+        # ── Anti-basi: kalau PUNCAK H1 juga SUDAH tersentuh di histori SETELAH IDM tersentuh (bukan
+        #    live, baru ketahuan sekarang krn baru dideteksi/redeploy atau tren masih jalan terus),
+        #    berarti window IDM->puncak yang ADA SEKARANG sudah lewat & basi — jangan masuk
+        #    WAIT_M5_CHOCH dulu (nanti cuma langsung "puncak kesentuh lagi" trivial krn peak_val
+        #    dihitung dari data yg SAMA ini). TETAP di WAIT_IDM_TOUCH (jangan 'remove' — biar gak
+        #    hancur-bikin-ulang tiap siklus & spam log): re-deteksi H1 normal di main loop akan
+        #    otomatis update swing_val/peak_val begitu tren benar2 lanjut ke struktur yang lebih baru.
+        peak_val = setup.get('peak_val')
+        if peak_val is not None:
+            touch_mask_peak = (df_m5['high'] >= peak_val) if stype == 'Long' else (df_m5['low'] <= peak_val)
+            after_touch_peak = touch_mask_peak.iloc[touched_idx + 1:closed_end]
+            if after_touch_peak.any():
+                return 'keep'   # basi — nunggu swing_val/peak_val ke-update oleh re-deteksi H1 normal
         setup['m5_scan_from_ts'] = float(df_m5['ts'].iloc[touched_idx])
         setup['phase'] = 'WAIT_M5_CHOCH'
         log_entry(f"👁️  {coin} {stype} (struct): IDM {idm_level:.6g} tersentuh M5 @ "
