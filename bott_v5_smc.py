@@ -2233,7 +2233,7 @@ def find_inducement(df_tf, big_stype, band_lo, band_hi, n=1, ts_lo=None, ts_hi=N
         is_break = (s['val'] > rec_v) if up else (s['val'] < rec_v)
         if not is_break:
             continue                                   # lower-high (Long) / higher-low (Short) -> bukan record, lewati
-        a_seg, b_seg = rec_i + 1, s['idx']             # low/high antar record, EKSKLUSIF candle record
+        a_seg, b_seg = rec_i + 1, s['idx'] + 1          # low/high antar record, INKLUSIF candle record-break akhir
         if b_seg > a_seg:
             if up:
                 seg = lo_a[a_seg:b_seg]; off = int(seg.argmin()); tval = float(seg.min())
@@ -3448,7 +3448,7 @@ def _build_idm_legs(df_tf, big_stype, n=1, ts_lo=None, ts_hi=None):
         is_break = (s['val'] > rec_v) if up else (s['val'] < rec_v)
         if not is_break:
             continue
-        a_seg, b_seg = rec_i + 1, s['idx']
+        a_seg, b_seg = rec_i + 1, s['idx'] + 1          # INKLUSIF candle record-break akhir
         if b_seg > a_seg:
             if up:
                 seg = lo_a[a_seg:b_seg]; off = int(seg.argmin()); tval = float(seg.min())
@@ -4211,8 +4211,9 @@ def run_bot():
                     mch = st.get('m5_choch_level'); mpk = st.get('m5_peak')
                     bk  = f"{bk:.6g}" if bk else "—"; idm = f"{idm:.6g}" if idm else "—"
                     mch = f"{mch:.6g}" if mch else "—"; mpk = f"{mpk:.6g}" if mpk else "—"
-                    ent = st.get('entry', 0)
-                    print(f"   {c} [{d}] (struct): {st.get('phase','?')} @ {ent:.6g} | "
+                    ent = st.get('entry')
+                    ent = f"{ent:.6g}" if ent else "—"
+                    print(f"   {c} [{d}] (struct): {st.get('phase','?')} @ {ent} | "
                           f"H1 break:{bk} IDM:{idm} | m5 CHoCH:{mch} m5-ekstrem:{mpk}")
         if idm_pending:
             for k, p in idm_pending.items():
